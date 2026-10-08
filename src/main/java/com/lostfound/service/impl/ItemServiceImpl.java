@@ -17,9 +17,11 @@ import org.springframework.cache.annotation.Caching;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -40,6 +42,20 @@ public class ItemServiceImpl implements ItemService {
      */
     private static final int MAX_PAGE = 200;
 
+    /** 合法的物品状态取值 —— 挡住任意字符串入库（原来 updateStatus 是直接写库的） */
+    private static final Set<String> VALID_ITEM_STATUSES = Set.of(
+            Item.STATUS_UNCLAIMED, Item.STATUS_CLAIMING, Item.STATUS_CLAIMED);
+
+    /**
+     * 认领流程允许驱动的物品状态转换。
+     * <p>
+     * <b>注意这里没有 {@code CLAIMED → UNCLAIMED}</b> —— 那是发布者主动纠错撤销，
+     * 属于人工操作，走 {@link #updateStatus}，不属于「流程副作用」。
+     */
+    private static final Map<String, Set<String>> CLAIM_DRIVEN_TRANSITIONS = Map.of(
+            Item.STATUS_UNCLAIMED, Set.of(Item.STATUS_CLAIMING),
+            Item.STATUS_CLAIMING, Set.of(Item.STATUS_CLAIMED, Item.STATUS_UNCLAIMED));
+
     private void limitPageSize (ItemPageQuery query) {
         // 防止一次查询太多数据,超过50条就默认50条
         if (query.getSize()>50) {
@@ -57,11 +73,12 @@ public class ItemServiceImpl implements ItemService {
     @Caching(evict = {
             @CacheEvict(value = "itemPage", allEntries = true),// 新物品发布，清空所有分页缓存
             @CacheEvict(value = "itemMypage", allEntries = true),// 新物品发布，清空所有我的发布缓存)
-            @CacheEvict(value = "foundPool", allEntries = true)// 候选全集变了，AI 召回必须能看到新物品
+            @CacheEvict(value = "foundPool", allEntries = true),// 候选全集变了，AI 召回必须能看到新物品
+            @CacheEvict(value = "lostPool", allEntries = true)   // 失物池同理：新发布的失物、状态变化都要让反向匹配看得到
     })
     public Item publish(Long userId, ItemCreateRequest request, String imageUrl) {
         // 校验 type 取值
-        if (!"LOST".equals(request.getType()) && !"FOUND".equals(request.getType())) {
+        if (!Item.TYPE_LOST.equals(request.getType()) && !Item.TYPE_FOUND.equals(request.getType())) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "物品类型只能为 LOST 或 FOUND");
         }
 
@@ -74,7 +91,7 @@ public class ItemServiceImpl implements ItemService {
         item.setDescription(request.getDescription());
         item.setImageUrl(imageUrl);
         item.setContact(request.getContact());
-        item.setStatus("UNCLAIMED");
+        item.setStatus(Item.STATUS_UNCLAIMED);
 
         itemMapper.insert(item);
         log.info("新物品发布: id={}, title={}, type={}", item.getId(), item.getTitle(), item.getType());
@@ -102,9 +119,13 @@ public class ItemServiceImpl implements ItemService {
         @CacheEvict(value = "itemPage", allEntries = true),     // 清所有分页（数据变了）
         @CacheEvict(value = "itemDetail", key = "#itemId"),   // 清这一条详情
         @CacheEvict(value = "itemMypage", allEntries = true),    // 清所有我的发布"
-        @CacheEvict(value = "foundPool", allEntries = true)      // 认领后要移出候选全集
+        @CacheEvict(value = "foundPool", allEntries = true),      // 认领后要移出候选全集
+        @CacheEvict(value = "lostPool", allEntries = true)   // 失物池同理：新发布的失物、状态变化都要让反向匹配看得到
     })
     public void updateStatus(Long itemId, Long userId, String status) {
+        // 状态值先过关：原来这里是任意字符串直接写库（比如传个 "HACK" 也落库）
+        assertValidItemStatus(status);
+
         // 乐观锁 + 重试：最多重试 3 次，防止并发认领冲突
         int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++) {
@@ -120,6 +141,16 @@ public class ItemServiceImpl implements ItemService {
             if(item.getStatus().equals(status)) {
                 return;
             }
+            // ⚠️ 认领闭环上线后，这个接口只保留「撤销」一个方向。
+            // 允许直接 UNCLAIMED → CLAIMED 就是留着一条绕过整条认领流程的后门：
+            // 物品没有一个申请人、没有一条流转日志，却显示已经归还。
+            // 状态只能由认领流程（changeStatusByClaim / revertToUnclaimedIfClaiming）推进，
+            // 否则「谁认领的、什么时候认领的」就永远是空的 —— 而那道题正是这个模块存在的理由。
+            if (!Item.STATUS_CLAIMED.equals(item.getStatus())
+                    || !Item.STATUS_UNCLAIMED.equals(status)) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "物品状态由认领流程推进；这里只能把「已认领」撤销回「待认领」");
+            }
             item.setStatus(status);
             int rows = itemMapper.updateById(item);
             if (rows > 0) {
@@ -131,6 +162,77 @@ public class ItemServiceImpl implements ItemService {
             log.warn("乐观锁冲突，第 {} 次重试: id={}", i + 1, itemId);
         }
         // 3 次都冲突 → 告诉用户重试
+        throw new BusinessException(ResultCode.INTERNAL_ERROR, "操作冲突，请稍后重试");
+    }
+
+    @Override
+    @Caching(evict = {
+            @CacheEvict(value = "itemPage", allEntries = true),      // 列表里的状态变了
+            @CacheEvict(value = "itemDetail", key = "#itemId"),      // 清这一条详情
+            @CacheEvict(value = "itemMypage", allEntries = true),    // 我的发布里的状态变了
+            @CacheEvict(value = "foundPool", allEntries = true),      // 候选全集的定义就是按状态筛的，必须清
+            @CacheEvict(value = "lostPool", allEntries = true)   // 失物池同理：新发布的失物、状态变化都要让反向匹配看得到
+    })
+    public void changeStatusByClaim(Long itemId, String expectedStatus, String targetStatus) {
+        assertValidItemStatus(expectedStatus);
+        assertValidItemStatus(targetStatus);
+        Set<String> allowed = CLAIM_DRIVEN_TRANSITIONS.getOrDefault(expectedStatus, Set.of());
+        if (!allowed.contains(targetStatus)) {
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    "认领流程不允许把物品状态从 " + expectedStatus + " 改为 " + targetStatus);
+        }
+
+        // 与 updateStatus 同一套乐观锁 + 重试机制
+        int maxRetries = 3;
+        for (int i = 0; i < maxRetries; i++) {
+            Item item = itemMapper.selectById(itemId);
+            if (item == null) {
+                throw new BusinessException(ResultCode.NOT_FOUND, "物品不存在");
+            }
+            // 已经是目标状态 → 幂等返回，不产生多余的写和 version 自增
+            if (targetStatus.equals(item.getStatus())) {
+                return;
+            }
+            // 状态既不是目标值、也不是期望值 → 被别人抢先改走了。
+            // 这里不硬改（硬改就是并发覆盖），而是明确告诉调用方「时机不对」。
+            if (!expectedStatus.equals(item.getStatus())) {
+                throw new BusinessException(ResultCode.CONFLICT,
+                        "物品当前状态为 " + item.getStatus() + "，操作未生效");
+            }
+            item.setStatus(targetStatus);
+            int rows = itemMapper.updateById(item);
+            if (rows > 0) {
+                log.info("物品状态随认领流程变更: id={}, {} -> {}", itemId, expectedStatus, targetStatus);
+                return;
+            }
+            log.warn("乐观锁冲突，第 {} 次重试: id={}", i + 1, itemId);
+        }
+        throw new BusinessException(ResultCode.INTERNAL_ERROR, "操作冲突，请稍后重试");
+    }
+
+    @Override
+    @Caching(evict = {
+            @CacheEvict(value = "itemPage", allEntries = true),
+            @CacheEvict(value = "itemDetail", key = "#itemId"),
+            @CacheEvict(value = "itemMypage", allEntries = true),
+            @CacheEvict(value = "foundPool", allEntries = true),
+            @CacheEvict(value = "lostPool", allEntries = true)   // 失物池同理：新发布的失物、状态变化都要让反向匹配看得到
+    })
+    public void revertToUnclaimedIfClaiming(Long itemId) {
+        int maxRetries = 3;
+        for (int i = 0; i < maxRetries; i++) {
+            Item item = itemMapper.selectById(itemId);
+            // 物品不在了、或者已经不是「认领中」—— 没什么可退的，直接返回（幂等）
+            if (item == null || !Item.STATUS_CLAIMING.equals(item.getStatus())) {
+                return;
+            }
+            item.setStatus(Item.STATUS_UNCLAIMED);
+            if (itemMapper.updateById(item) > 0) {
+                log.info("无活跃申请，物品退回待认领: id={}", itemId);
+                return;
+            }
+            log.warn("乐观锁冲突，第 {} 次重试: id={}", i + 1, itemId);
+        }
         throw new BusinessException(ResultCode.INTERNAL_ERROR, "操作冲突，请稍后重试");
     }
 
@@ -151,26 +253,69 @@ public class ItemServiceImpl implements ItemService {
         return itemMapper.selectList(wrapper);
     }
 
+    @Override
+    public Map<Long, Item> mapByIds(Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            // 空集合必须提前返回：selectBatchIds 会拼出 `WHERE id IN ()`，那是条语法错误的 SQL
+            return Map.of();
+        }
+        // 不加缓存：这是列表页的拼装查询，按 id 组合几乎不重复，缓存命中率低而失效成本高
+        return itemMapper.selectBatchIds(ids).stream()
+                .collect(Collectors.toMap(Item::getId, Function.identity()));
+    }
+
     /**
-     * 全量未认领招领物品 —— 召回用的候选全集。
+     * 全量「还没被认领走」的招领物品 —— 召回用的候选全集。
+     * <p>
+     * <b>含 UNCLAIMED 和 CLAIMING，只排除 CLAIMED</b>。理由：有申请 ≠ 已归还，
+     * 申请可能被驳回，第二个人仍应能搜到它。若把 CLAIMING 排除，等于第一个申请人
+     * 把物品从 AI 视野里藏了起来。
      * <p>
      * 加缓存的原因：召回每次请求都要扫一遍这个集合来打分，
-     * 而集合本身变化很少（只有发布新物品或有人认领时才变）。
+     * 而集合本身变化很少（只有发布新物品或状态变化时才变）。
      * 不缓存的话每个 AI 请求都要把上千行捞出来，纯浪费。
      * <p>
-     * 新鲜度靠 publish / updateStatus 上的 @CacheEvict("foundPool") 保证 ——
+     * 新鲜度靠 publish / updateStatus / changeStatusByClaim 上的 @CacheEvict("foundPool") 保证 ——
      * 缓存和失效必须成对写，只写一边就会出现「发布了新物品但召回永远看不到它」。
+     * <p>
+     * ⚠️ 每次加新的「会改物品状态」的写路径，都必须同步补这条 @CacheEvict，
+     * 否则会出现「库里已是 CLAIMING，AI 仍按 UNCLAIMED 召回」。
      */
     @Override
     @Cacheable(value = "foundPool", key = "'all'")
     public List<Item> listUnclaimedFound() {
+        return listUnclaimedByType(Item.TYPE_FOUND);
+    }
+
+    /**
+     * 还在找的失物全集 —— 「发布招领后反向匹配」用的候选池。
+     * <p>
+     * 和招领池是镜像关系。失物实际上不会有 CLAIMING 状态（认领只针对招领），
+     * 但这里**刻意沿用和招领池完全相同的状态条件** —— 两个池子的语义就是对称的，
+     * 没必要为一个"反正不会出现"的状态写两套条件。
+     */
+    @Override
+    @Cacheable(value = "lostPool", key = "'all'")
+    public List<Item> listUnclaimedLost() {
+        return listUnclaimedByType(Item.TYPE_LOST);
+    }
+
+    /** 两个池子共用的查法，避免"同一条 SQL 写两遍" */
+    private List<Item> listUnclaimedByType(String type) {
         LambdaQueryWrapper<Item> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(Item::getType, "FOUND")
-                .eq(Item::getStatus, "UNCLAIMED");
+        wrapper.eq(Item::getType, type)
+                .in(Item::getStatus, Item.STATUS_UNCLAIMED, Item.STATUS_CLAIMING);
         return itemMapper.selectList(wrapper);
     }
 
     // ===================== 私有方法 =====================
+
+    /** 校验物品状态取值合法 */
+    private void assertValidItemStatus(String status) {
+        if (!VALID_ITEM_STATUSES.contains(status)) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "非法的物品状态: " + status);
+        }
+    }
 
     /**
      * 延迟关联分页 —— 解决深分页时优化器放弃索引、改走全表扫描的问题。

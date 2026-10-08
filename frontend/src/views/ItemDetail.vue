@@ -13,6 +13,21 @@ const item = ref(null)
 const publisherName = ref('')
 const loading = ref(true)
 
+// ── 认领申请弹窗 ──
+const claimDialog = ref(false)
+const submitting = ref(false)
+const claimForm = ref({ proofText: '', contact: '' })
+
+// 物品状态的中文名与配色。认领流程引入了中间的「认领中」，
+// 原来「不是 UNCLAIMED 就是已认领」的二分会把它显示错
+const STATUS_TEXT = { UNCLAIMED: '未认领', CLAIMING: '认领中', CLAIMED: '已认领' }
+const STATUS_TAG = { UNCLAIMED: 'warning', CLAIMING: 'primary', CLAIMED: 'info' }
+const MY_CLAIM_TEXT = { PENDING: '认领申请审核中', APPROVED: '认领申请已通过，请联系发布者' }
+
+const statusText = (s) => STATUS_TEXT[s] || s
+const statusTag = (s) => STATUS_TAG[s] || 'info'
+const myClaimText = (s) => MY_CLAIM_TEXT[s] || s
+
 async function load() {
   loading.value = true
   try {
@@ -30,19 +45,67 @@ function isOwner() {
   return item.value && Number(auth.userId) === item.value.userId
 }
 
-async function markClaimed() {
+function goReview() {
+  router.push('/claims/received')
+}
+
+/**
+ * 撤销「已认领」。
+ *
+ * 注意这里**没有**「标记为已认领」—— 那个按钮下线了。
+ * 物品从「待认领」走到「已认领」必须经过认领流程（有人申请、有人审核、有人确认收到），
+ * 否则库里会出现一条"已归还但没有任何申请记录"的物品，谁认领的、什么时候认领的都无从查起。
+ * 保留撤销是为了纠错：物归原主后发现认错了人，得能改回来。
+ */
+async function undoClaimed() {
   try {
     await ElMessageBox.confirm(
-      '标记后这条信息会显示为「已认领」，其他失主不会再联系你。确定吗？',
-      '确认标记为已认领',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '再想想' }
+      '撤销后这条物品会回到「待认领」，重新接受认领申请。已经产生的认领记录会保留。确定吗？',
+      '撤销「已认领」',
+      { type: 'warning', confirmButtonText: '撤销', cancelButtonText: '再想想' }
     )
   } catch {
     return // 用户点了取消
   }
-  await request.put(`/item/${item.value.id}/status`, null, { params: { status: 'CLAIMED' } })
-  ElMessage.success('操作成功')
+  await request.put(`/item/${item.value.id}/status`, null, { params: { status: 'UNCLAIMED' } })
+  ElMessage.success('已撤销')
   load()
+}
+
+// ── 认领申请 ──────────────────────────────────────────────
+
+function openClaimDialog() {
+  // 这个页面游客也能看，但申请必须登录（后端同样会拦，这里只是别让人白填一遍表单）
+  if (!auth.isLogin) {
+    ElMessage.info('登录后才能申请认领')
+    router.push('/login')
+    return
+  }
+  claimDialog.value = true
+}
+
+async function submitClaim() {
+  const proofText = claimForm.value.proofText.trim()
+  // 前端只挡最明显的一种：太短。其余规则（是不是自己的物品、有没有重复申请）
+  // 一律以后端为准 —— 前端校验只是体验，不是防线
+  if (proofText.length < 10) {
+    ElMessage.warning('特征证明请至少写 10 个字，太短的描述没法用来核对')
+    return
+  }
+  submitting.value = true
+  try {
+    await request.post('/claim', {
+      itemId: item.value.id,
+      proofText,
+      contact: claimForm.value.contact.trim() || null,
+    })
+    ElMessage.success('申请已提交，等待发布者审核')
+    claimDialog.value = false
+    claimForm.value = { proofText: '', contact: '' }
+    load()
+  } finally {
+    submitting.value = false
+  }
 }
 
 // 联系方式大多是手机号/微信号，让用户手动选中复制很烦，给个一键复制
@@ -91,12 +154,8 @@ onMounted(load)
             <span class="pill" :class="item.type === 'LOST' ? 'lost' : 'found'">
               {{ item.type === 'LOST' ? '寻物' : '招领' }}
             </span>
-            <el-tag
-              :type="item.status === 'UNCLAIMED' ? 'warning' : 'info'"
-              effect="light"
-              round
-            >
-              {{ item.status === 'UNCLAIMED' ? '未认领' : '已认领' }}
+            <el-tag :type="statusTag(item.status)" effect="light" round>
+              {{ statusText(item.status) }}
             </el-tag>
             <el-tag type="info" effect="plain" round>{{ item.category || '未分类' }}</el-tag>
           </div>
@@ -126,18 +185,63 @@ onMounted(load)
             <div class="contact-label">联系方式</div>
             <div class="contact-value">
               <span v-if="item.contact">{{ item.contact }}</span>
+              <!-- 分清两种"看不到"：被规则藏起来了，还是发布者根本就没填 -->
+              <span v-else-if="!item.contactVisible" class="muted">通过认领审核后可见</span>
               <span v-else class="muted">发布者未留下联系方式</span>
               <el-button v-if="item.contact" size="small" type="primary" plain @click="copyContact">
                 <el-icon><CopyDocument /></el-icon>复制
               </el-button>
             </div>
+            <div v-if="!item.contactVisible" class="contact-note">
+              为保证物品真的交还到失主手里，联系方式只对发布者本人和认领审核通过的人开放。
+            </div>
           </div>
 
-          <div v-if="isOwner() && item.status === 'UNCLAIMED'" class="owner-actions">
-            <el-button type="success" @click="markClaimed">
-              <el-icon><Select /></el-icon>标记为已认领
+          <!-- 非发布者：认领入口 -->
+          <div v-if="!isOwner() && item.type === 'FOUND'" class="claim-actions">
+            <template v-if="item.myClaimStatus">
+              <el-tag
+                :type="item.myClaimStatus === 'APPROVED' ? 'success' : 'warning'"
+                effect="light"
+                round
+                size="large"
+              >
+                {{ myClaimText(item.myClaimStatus) }}
+              </el-tag>
+              <span v-if="item.myClaimStatus === 'PENDING'" class="hint">
+                发布者审核通过后，这里会显示联系方式
+              </span>
+              <el-button
+                v-else
+                link
+                type="primary"
+                @click="router.push('/claims/my')"
+              >
+                拿到物品后去「我的申请」确认收到
+              </el-button>
+            </template>
+            <el-tag v-else-if="item.status === 'CLAIMED'" type="info" effect="light" round size="large">
+              该物品已被认领
+            </el-tag>
+            <template v-else>
+              <el-button type="primary" size="large" @click="openClaimDialog">
+                我要认领
+              </el-button>
+              <span class="hint">需要描述只有失主才知道的特征，由发布者审核</span>
+            </template>
+          </div>
+
+          <div v-if="isOwner()" class="owner-actions">
+            <!-- 物品进入「认领中」说明有人申请了，把发布者引到审核台去 -->
+            <el-button v-if="item.status === 'CLAIMING'" type="primary" @click="goReview">
+              <el-icon><Tickets /></el-icon>去审核认领申请
             </el-button>
-            <span class="hint">只有发布者本人能看到这个按钮</span>
+            <el-button v-else link type="primary" @click="goReview">查看认领申请</el-button>
+
+            <el-button v-if="item.status === 'CLAIMED'" link type="danger" @click="undoClaimed">
+              撤销「已认领」
+            </el-button>
+            <span class="hint">只有发布者本人能看到这些按钮</span>
           </div>
         </div>
       </div>
@@ -146,6 +250,34 @@ onMounted(load)
     <el-empty v-else description="物品不存在或已被删除">
       <el-button type="primary" @click="router.push('/items')">返回列表</el-button>
     </el-empty>
+
+    <!-- 认领申请：填特征证明 → 提交 → 等发布者审核 -->
+    <el-dialog v-model="claimDialog" title="申请认领" width="520px">
+      <el-form label-position="top">
+        <el-form-item label="物品特征证明" required>
+          <el-input
+            v-model="claimForm.proofText"
+            type="textarea"
+            :rows="4"
+            maxlength="500"
+            show-word-limit
+            placeholder="请描述只有失主才知道的特征：划痕位置、贴纸、内含物、锁屏壁纸……"
+          />
+          <div class="hint">至少 10 个字。这些内容只有发布者能看到，不会公开。</div>
+        </el-form-item>
+        <el-form-item label="联系方式（选填）">
+          <el-input
+            v-model="claimForm.contact"
+            maxlength="100"
+            placeholder="方便发布者联系你；留空则使用账号手机号"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="claimDialog = false">取消</el-button>
+        <el-button type="primary" :loading="submitting" @click="submitClaim">提交申请</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -303,6 +435,22 @@ onMounted(load)
   font-size: 14px;
   font-weight: 400;
   color: var(--lf-text-muted);
+}
+
+.contact-note {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--lf-text-muted);
+}
+
+/* ── 认领入口 ─────────────────────────────────────────────── */
+.claim-actions {
+  margin-top: 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 /* ── 发布者操作 ───────────────────────────────────────────── */

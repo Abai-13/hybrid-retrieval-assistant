@@ -10,7 +10,12 @@ const routes = [
   { path: '/publish', component: () => import('../views/Publish.vue') },
   { path: '/ai', component: () => import('../views/AiChat.vue') },
   { path: '/profile', component: () => import('../views/Profile.vue') },
+  { path: '/claims/received', component: () => import('../views/ClaimReview.vue') },
+  { path: '/claims/my', component: () => import('../views/MyClaims.vue') },
+  { path: '/notifications', component: () => import('../views/Notifications.vue') },
 ]
+
+const NEED_LOGIN = ['/publish', '/ai', '/profile', '/claims/received', '/claims/my', '/notifications']
 
 const router = createRouter({
   history: createWebHistory(),
@@ -19,7 +24,7 @@ const router = createRouter({
 
 // 路由守卫：访问需要登录的页面时，先检查有没有 token
 router.beforeEach((to) => {
-  const needLogin = ['/publish', '/ai', '/profile'].includes(to.path)
+  const needLogin = NEED_LOGIN.includes(to.path)
   if (needLogin && !localStorage.getItem('token')) {
     return '/login'
   }

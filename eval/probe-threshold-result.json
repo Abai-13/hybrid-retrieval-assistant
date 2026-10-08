@@ -1,0 +1,140 @@
+{
+  "ranAt": "2026-10-08T07:58:38.287Z",
+  "threshold": 80,
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "minScore": 0,
+  "maxResults": 5,
+  "completed": true,
+  "aborted": null,
+  "rows": [
+    {
+      "kind": "简单",
+      "query": "急死我了，谁在计算机学院机房捡到一把银色的汽车钥匙啊，好像是大众的，麻烦联系我一下！",
+      "groundTruthId": 1703,
+      "inRecallPool": false,
+      "candidateRank": 0,
+      "pickedByLlm": false,
+      "score": null,
+      "survivesThreshold": null,
+      "shownCount": 0,
+      "verdict": "④ 召回未捞到（与阈值无关）",
+      "degradeReason": null,
+      "recommendations": []
+    },
+    {
+      "kind": "中等",
+      "query": "有没有人在大学生活动中心附近捡到一个银色的手表啊，好像是落在那边了，急死我了",
+      "groundTruthId": 2132,
+      "inRecallPool": true,
+      "candidateRank": 5,
+      "pickedByLlm": true,
+      "score": 90,
+      "survivesThreshold": true,
+      "shownCount": 5,
+      "verdict": "① 命中且高分",
+      "degradeReason": null,
+      "recommendations": [
+        {
+          "itemId": 2132,
+          "score": 90
+        },
+        {
+          "itemId": 394345,
+          "score": 90
+        },
+        {
+          "itemId": 404489,
+          "score": 90
+        },
+        {
+          "itemId": 406490,
+          "score": 90
+        },
+        {
+          "itemId": 408678,
+          "score": 90
+        }
+      ]
+    },
+    {
+      "kind": "困难",
+      "query": "有没有人这两天在三号楼下捡到一本学Java用的那个“圣经”啊，封面是机械工业出版社的，我快急死了！",
+      "groundTruthId": 1757,
+      "inRecallPool": false,
+      "candidateRank": 0,
+      "pickedByLlm": false,
+      "score": null,
+      "survivesThreshold": null,
+      "shownCount": 0,
+      "verdict": "④ 召回未捞到（与阈值无关）",
+      "degradeReason": null,
+      "recommendations": []
+    },
+    {
+      "kind": "排第2-5位",
+      "query": "刚在学生活动中心那边丢了一张蓝色的学生卡，好像是掉在哪个角落了，有没有好心人看到啊，急死了！",
+      "groundTruthId": 2453,
+      "inRecallPool": false,
+      "candidateRank": 0,
+      "pickedByLlm": false,
+      "score": null,
+      "survivesThreshold": null,
+      "shownCount": 4,
+      "verdict": "④ 召回未捞到（与阈值无关）",
+      "degradeReason": null,
+      "recommendations": [
+        {
+          "itemId": 393900,
+          "score": 80
+        },
+        {
+          "itemId": 394053,
+          "score": 80
+        },
+        {
+          "itemId": 394838,
+          "score": 80
+        },
+        {
+          "itemId": 396100,
+          "score": 80
+        }
+      ]
+    },
+    {
+      "kind": "精排失败",
+      "query": "今天下午在报告厅好像落了一副白色的无线耳机，不知道有没有人捡到？",
+      "groundTruthId": 2302,
+      "inRecallPool": true,
+      "candidateRank": 1,
+      "pickedByLlm": false,
+      "score": null,
+      "survivesThreshold": null,
+      "shownCount": 5,
+      "verdict": "③ 精排未选中（与阈值无关）",
+      "degradeReason": null,
+      "recommendations": [
+        {
+          "itemId": 457998,
+          "score": 80
+        },
+        {
+          "itemId": 459999,
+          "score": 75
+        },
+        {
+          "itemId": 462000,
+          "score": 70
+        },
+        {
+          "itemId": 464001,
+          "score": 65
+        },
+        {
+          "itemId": 466002,
+          "score": 60
+        }
+      ]
+    }
+  ]
+}

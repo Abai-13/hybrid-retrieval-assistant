@@ -9,6 +9,18 @@ import java.time.LocalDateTime;
 @TableName("item")
 public class Item {
 
+    /** 寻求帮助：我丢了东西 */
+    public static final String TYPE_LOST = "LOST";
+    /** 提供帮助：我捡到东西 */
+    public static final String TYPE_FOUND = "FOUND";
+
+    /** 待认领：无人申请 */
+    public static final String STATUS_UNCLAIMED = "UNCLAIMED";
+    /** 认领中：至少存在一条活跃（PENDING/APPROVED）的认领申请 */
+    public static final String STATUS_CLAIMING = "CLAIMING";
+    /** 已认领：认领流程走完，物品已归还 */
+    public static final String STATUS_CLAIMED = "CLAIMED";
+
     @TableId(type = IdType.AUTO)
     private Long id;
 
@@ -30,7 +42,7 @@ public class Item {
 
     private String contact;
 
-    /** UNCLAIMED: 未认领, CLAIMED: 已认领 */
+    /** UNCLAIMED: 待认领, CLAIMING: 认领中, CLAIMED: 已认领 */
     private String status;
 
     /** 乐观锁版本号 — 每次更新自增 1，防止并发覆盖 */

@@ -105,6 +105,10 @@ async function ask(text) {
         candidates: d.candidateCount,
         elapsed: d.elapsedMs,
         degrade: d.degradeReason,
+        // 被"最低匹配分"挡下的条数。它和"模型压根没匹配到"是两回事，
+        // 后端已经把两者的文案分开生成了，这里只是额外标出来方便排查
+        belowThreshold: d.belowThresholdCount || 0,
+        minScore: d.minScore,
       },
       degraded: !!d.degradeReason,
     })
@@ -224,8 +228,14 @@ function scoreColor(score) {
                 </div>
               </div>
 
-              <!-- 匹配模式下一无所获 -->
-              <div v-else-if="m.matches && m.matches.length === 0 && !m.error" class="no-match">
+              <!-- 匹配模式下一无所获。
+                   ⚠️ 只在「真的没匹配上」时显示：如果是被最低分挡下的，
+                   后端已经在气泡文案里说清「暂未发现高度匹配的物品 + 还有几条相似度低的」，
+                   这里再补一句"没有匹配到"会把话说反，让用户以为平台上一定没有。 -->
+              <div
+                v-else-if="m.matches && m.matches.length === 0 && !m.error && !m.meta.belowThreshold"
+                class="no-match"
+              >
                 没有匹配到招领信息，换个描述再试试
               </div>
 
@@ -238,7 +248,11 @@ function scoreColor(score) {
                   召回为空，未调用大模型
                 </el-tag>
                 <span v-else>
-                  从 {{ m.meta.candidates }} 条候选中匹配 · 耗时 {{ m.meta.elapsed }}ms
+                  从 {{ m.meta.candidates }} 条候选中匹配
+                  <template v-if="m.meta.belowThreshold">
+                    · 已按匹配度（≥{{ m.meta.minScore }} 分）筛掉 {{ m.meta.belowThreshold }} 条
+                  </template>
+                  · 耗时 {{ m.meta.elapsed }}ms
                 </span>
               </div>
             </div>

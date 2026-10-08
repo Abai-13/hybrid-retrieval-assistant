@@ -21,4 +21,12 @@ public interface CandidateService {
      * @return 按相关度从高到低排序的候选；没有任何字符重合时返回空列表
      */
     List<Item> recall(String query, int topK);
+
+    /**
+     * 指定候选池的召回。
+     *
+     * @param poolType {@link com.lostfound.entity.Item#TYPE_FOUND}（失物描述找招领）
+     *                 或 {@link com.lostfound.entity.Item#TYPE_LOST}（招领描述找失物）
+     */
+    List<Item> recall(String query, String poolType, int topK);
 }

@@ -14,6 +14,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -78,6 +79,24 @@ public class UserServiceImpl implements UserService {
     public String getNicknameById(Long userId) {
         User user = userMapper.selectById(userId);
         return user != null ? user.getNickname() : "未知用户";
+    }
+
+    @Override
+    public Map<Long, String> mapNicknamesByIds(Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, String> result = new HashMap<>();
+        // 用循环而不是 Collectors.toMap：toMap 遇到 null 值会抛 NPE，
+        // 而 nickname 是允许为空的字段（注册时虽然会兜底成 username，但老数据不保证）
+        for (User user : userMapper.selectBatchIds(ids)) {
+            String nickname = user.getNickname();
+            if (nickname == null) {
+                nickname = user.getUsername() != null ? user.getUsername() : "未知用户";
+            }
+            result.put(user.getId(), nickname);
+        }
+        return result;
     }
 
     @Override

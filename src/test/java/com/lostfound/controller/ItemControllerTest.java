@@ -3,6 +3,8 @@ package com.lostfound.controller;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.lostfound.config.JwtUtil;
 import com.lostfound.entity.Item;
+import com.lostfound.service.AutoMatchService;
+import com.lostfound.service.ClaimService;
 import com.lostfound.service.FileService;
 import com.lostfound.service.ItemService;
 import com.lostfound.service.UserService;
@@ -18,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
@@ -47,6 +50,14 @@ class ItemControllerTest {
     @MockBean
     private FileService fileService;
 
+    /** 详情接口要靠它判断「联系方式能不能给这个人看」 */
+    @MockBean
+    private ClaimService claimService;
+
+    /** 发布成功后 Controller 会触发它做后台自动匹配（异步，mock 掉不产生副作用） */
+    @MockBean
+    private AutoMatchService autoMatchService;
+
     /** JwtInterceptor 依赖 JwtUtil，@WebMvcTest 不会加载它，必须 @MockBean 补上 */
     @MockBean
     private JwtUtil jwtUtil;
@@ -61,6 +72,13 @@ class ItemControllerTest {
         item.setType("LOST");
         item.setCategory("证件");
         item.setStatus(status);
+        return item;
+    }
+
+    private Item buildFoundItemWithContact(Long id, Long userId) {
+        Item item = buildItem(id, userId, Item.STATUS_UNCLAIMED);
+        item.setType(Item.TYPE_FOUND);
+        item.setContact("13800000000");
         return item;
     }
 
@@ -151,5 +169,69 @@ class ItemControllerTest {
                 .andExpect(jsonPath("$.code").value(200))
                 .andExpect(jsonPath("$.data.item.title").value("校园卡"))
                 .andExpect(jsonPath("$.data.publisherName").value("小白"));
+    }
+
+    // ==================== 详情：联系方式按身份收敛 ====================
+
+    @Test
+    @DisplayName("详情：游客看不到联系方式（contact 置空 + contactVisible=false）")
+    void detail_guestCannotSeeContact() throws Exception {
+        when(itemService.getById(1L)).thenReturn(buildFoundItemWithContact(1L, 100L));
+        when(userService.getNicknameById(any())).thenReturn("小白");
+
+        mockMvc.perform(get("/api/item/1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.item.title").value("校园卡"))
+                .andExpect(jsonPath("$.data.item.contactVisible").value(false))
+                .andExpect(jsonPath("$.data.item.contact").isEmpty());
+    }
+
+    @Test
+    @DisplayName("详情：发布者本人看得到联系方式")
+    void detail_ownerCanSeeContact() throws Exception {
+        when(jwtUtil.validate(TOKEN)).thenReturn(true);
+        when(jwtUtil.getUserId(TOKEN)).thenReturn(100L);
+        when(itemService.getById(1L)).thenReturn(buildFoundItemWithContact(1L, 100L));
+        when(userService.getNicknameById(any())).thenReturn("小白");
+
+        mockMvc.perform(get("/api/item/1").header("Authorization", "Bearer " + TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.item.contactVisible").value(true))
+                .andExpect(jsonPath("$.data.item.contact").value("13800000000"))
+                .andExpect(jsonPath("$.data.item.myClaimStatus").isEmpty());
+    }
+
+    @Test
+    @DisplayName("详情：审核已通过的申请人看得到联系方式，并带出自己的申请状态")
+    void detail_approvedApplicantCanSeeContact() throws Exception {
+        when(jwtUtil.validate(TOKEN)).thenReturn(true);
+        when(jwtUtil.getUserId(TOKEN)).thenReturn(200L);
+        when(itemService.getById(1L)).thenReturn(buildFoundItemWithContact(1L, 100L));
+        when(userService.getNicknameById(any())).thenReturn("小白");
+        when(claimService.canSeeContact(anyLong(), any())).thenReturn(true);
+        when(claimService.activeClaimStatus(anyLong(), any())).thenReturn("APPROVED");
+
+        mockMvc.perform(get("/api/item/1").header("Authorization", "Bearer " + TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.item.contactVisible").value(true))
+                .andExpect(jsonPath("$.data.item.contact").value("13800000000"))
+                .andExpect(jsonPath("$.data.item.myClaimStatus").value("APPROVED"));
+    }
+
+    @Test
+    @DisplayName("详情：审核中的申请人看不到联系方式，但能看到自己的申请状态")
+    void detail_pendingApplicantCannotSeeContactYet() throws Exception {
+        when(jwtUtil.validate(TOKEN)).thenReturn(true);
+        when(jwtUtil.getUserId(TOKEN)).thenReturn(300L);
+        when(itemService.getById(1L)).thenReturn(buildFoundItemWithContact(1L, 100L));
+        when(userService.getNicknameById(any())).thenReturn("小白");
+        when(claimService.canSeeContact(anyLong(), any())).thenReturn(false);
+        when(claimService.activeClaimStatus(anyLong(), any())).thenReturn("PENDING");
+
+        mockMvc.perform(get("/api/item/1").header("Authorization", "Bearer " + TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.item.contactVisible").value(false))
+                .andExpect(jsonPath("$.data.item.contact").isEmpty())
+                .andExpect(jsonPath("$.data.item.myClaimStatus").value("PENDING"));
     }
 }

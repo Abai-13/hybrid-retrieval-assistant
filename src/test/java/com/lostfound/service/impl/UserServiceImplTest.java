@@ -44,7 +44,7 @@ class UserServiceImplTest {
         req.setUsername(username);
         req.setPassword(password);
         req.setNickname("测试昵称");
-        req.setPhone("19029339960");
+        req.setPhone("13800000000");
         return req;
     }
 

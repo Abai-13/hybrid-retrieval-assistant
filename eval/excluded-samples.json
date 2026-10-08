@@ -1,0 +1,125 @@
+{
+  "generatedAt": "2026-10-08T08:10:01.230Z",
+  "policy": "不删除、不修改任何原始样本；命中判定仍严格要求 itemId 相等。绝不采用「同标题任意一条都算命中」——同标题的两个条目通常是两件不同的真实物品。",
+  "criteria": {
+    "L1": "系统可见的全部文本字段（title/category/location/description）完全相同 → 彻底不可辨识",
+    "L2": "title + category + location 相同，仅描述措辞不同 → 需人工判断"
+  },
+  "totalSamples": 146,
+  "excludedCount": 11,
+  "effectiveCount": 135,
+  "excluded": [
+    {
+      "groundTruthId": 1750,
+      "level": "L2",
+      "title": "拾到的谢希仁 第八版 《计算机网络》",
+      "location": "计算机学院机房",
+      "twins": [
+        1188
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #1188），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 2037,
+      "level": "L2",
+      "title": "捡到同济大学 第七版上册 《高等数学》",
+      "location": "体育馆羽毛球馆",
+      "twins": [
+        1040,
+        2582
+      ],
+      "reason": "同标题同类别同地点共 3 条（另有 #1040、#2582），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 2453,
+      "level": "L2",
+      "title": "校园卡",
+      "location": "大学生活动中心",
+      "twins": [
+        1718,
+        2802
+      ],
+      "reason": "同标题同类别同地点共 3 条（另有 #1718、#2802），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 1497,
+      "level": "L2",
+      "title": "拾到的《Java 编程思想》",
+      "location": "南门快递站",
+      "twins": [
+        1137
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #1137），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 1387,
+      "level": "L1",
+      "title": "拾到的汤小丹 第四版 《操作系统》",
+      "location": "图书馆一楼自习室",
+      "twins": [
+        2599
+      ],
+      "reason": "存在字段完全相同的孪生条目 #2599（title/category/location/description 逐字相同）—— 任何模型都无法区分，标签不可判定"
+    },
+    {
+      "groundTruthId": 1167,
+      "level": "L2",
+      "title": "机械工业 第四版 《Java 编程思想》",
+      "location": "五号宿舍楼门口",
+      "twins": [
+        1926
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #1926），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 2298,
+      "level": "L1",
+      "title": "捡到李永乐 2025版 《考研数学复习全书》",
+      "location": "操场看台",
+      "twins": [
+        2383
+      ],
+      "reason": "存在字段完全相同的孪生条目 #2383（title/category/location/description 逐字相同）—— 任何模型都无法区分，标签不可判定"
+    },
+    {
+      "groundTruthId": 2231,
+      "level": "L2",
+      "title": "方格 笔记本",
+      "location": "校车站台",
+      "twins": [
+        2110
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #2110），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 1947,
+      "level": "L2",
+      "title": "严蔚敏 C语言版 《数据结构》",
+      "location": "南门快递站",
+      "twins": [
+        1438
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #1438），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 1543,
+      "level": "L2",
+      "title": "捡到严蔚敏 C语言版 《数据结构》",
+      "location": "报告厅",
+      "twins": [
+        1597
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #1597），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    },
+    {
+      "groundTruthId": 1815,
+      "level": "L2",
+      "title": "图书借阅证",
+      "location": "报告厅",
+      "twins": [
+        2272
+      ],
+      "reason": "同标题同类别同地点共 2 条（另有 #2272），描述为互相改写 —— 需人工判断 query 是否携带了足够区分的信息"
+    }
+  ]
+}

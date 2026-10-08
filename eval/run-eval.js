@@ -15,8 +15,14 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { DEFAULT_API, assertEvalBackend } from './eval-guard.js';
 
-const API = 'http://localhost:8080';
+// 目标后端地址：默认主环境端口，评测时用 AI_API 指到评测环境（8081）。
+// 连错环境的代价不是报错，而是**静默给出错误的指标** —— 所以下面还会做目标检查。
+const API = DEFAULT_API;
+
+/** 需人工复核、暂不纳入主要指标的样本（判据与原因见该文件） */
+const EXCLUDE_FILE = 'eval/excluded-samples.json';
 const LABEL = process.argv[2] || 'baseline';
 const DATASET = 'eval/dataset.jsonl';
 const KS = [1, 3, 5];
@@ -89,6 +95,12 @@ async function pool(items, limit, fn) {
             recallRank: 0,
             matched: 0,
             returnedIds: [],
+            // 字段与成功行保持一致，免得下游脚本还要判断字段存不存在
+            scores: [],
+            model: null,
+            minScore: null,
+            maxResults: null,
+            belowThresholdCount: null,
             promptTokens: 0,
             completionTokens: 0,
             elapsedMs: 0,
@@ -152,6 +164,38 @@ async function main() {
     .map((l) => JSON.parse(l));
   console.log(`评测集 ${dataset.length} 条，标签 = ${LABEL}`);
 
+  // ── 「待人工复核」排除清单（放在最前，空跑与正式跑共用）──
+  // 判定标准与逐条原因见 eval/excluded-samples.json。
+  // 强调：这里是**把样本排除出指标**，不是放宽命中判定 —— 命中始终严格要求 itemId 相等，
+  // 绝不接受「同标题任意一条都算对」（同标题的两个条目通常是两件不同的真实物品）。
+  let excludedIds = new Set();
+  let exclusion = null;
+  try {
+    exclusion = JSON.parse(readFileSync(EXCLUDE_FILE, 'utf8'));
+    excludedIds = new Set(exclusion.excluded.map((e) => e.groundTruthId));
+  } catch {
+    console.warn(`⚠️  没找到 ${EXCLUDE_FILE}，本次按全部样本统计（含不可辨识的样本）。`);
+  }
+  const effectiveCount = dataset.filter((d) => !excludedIds.has(d.groundTruthId)).length;
+
+  // 空跑：只确认数据集、排除清单、目标地址就位 —— 不连后端、不调模型、不花钱
+  if (process.argv.includes('--dry')) {
+    console.log(`\n【空跑模式】`);
+    console.log(`  目标后端    ：${API}（正式跑前会做「是否误连主库」检查）`);
+    console.log(`  有效样本    ：${effectiveCount} / ${dataset.length}` +
+      (exclusion ? `（排除 ${exclusion.excluded.length} 条待人工复核）` : ''));
+    if (exclusion) {
+      exclusion.excluded.forEach((e) =>
+        console.log(`     ${e.level}  #${e.groundTruthId}  ${e.title || ''} — ${e.reason?.slice(0, 40) || ''}…`));
+    }
+    console.log(`  报告与明细将写入：eval/report-${LABEL}.md、eval/results-${LABEL}.jsonl`);
+    console.log('\n（空跑结束，未发起任何请求）');
+    return;
+  }
+
+  // 先确认连的是干净评测库 —— 连到主库的话，12.6 万条压测数据会把指标彻底污染
+  await assertEvalBackend(API);
+
   const token = await login();
   const started = Date.now();
 
@@ -169,6 +213,17 @@ async function main() {
       recallRank: (data.candidateIds || []).indexOf(d.groundTruthId) + 1,
       matched: (data.matches || []).length,
       returnedIds: (data.matches || []).map((m) => m.itemId),
+      // ⚠️ 逐条 match 的分数必须落盘。
+      //    只存 returnedIds 的话，「第 3 位那条打了多少分」就永远丢了 ——
+      //    而调阈值全靠这个分布：存了它，70/75/80/85/90 就能**离线**反复比较，不用再花钱重跑。
+      //    历史报告就是缺这一项，导致"80 分合不合适"至今没有数据支撑。
+      scores: (data.matches || []).map((m) => ({ itemId: m.itemId, score: m.score })),
+      // 本次真正生效的模型与展示规则，由后端在响应里回显 ——
+      // 比让人记得在命令行传对环境变量可靠得多（历史报告里连模型都没记，事后无法区分对照组）
+      model: data.model ?? null,
+      minScore: data.minScore ?? null,
+      maxResults: data.maxResults ?? null,
+      belowThresholdCount: data.belowThresholdCount ?? null,
       candidateCount: data.candidateCount,
       promptTokens: data.promptTokens,
       completionTokens: data.completionTokens,
@@ -205,23 +260,55 @@ async function main() {
     console.error(`🔴 降级率 ${(degradeRate * 100).toFixed(1)}% 过高 —— 说明这家供应商的可用性有问题，报告要谨慎解读`);
   }
 
-  const overall = summarize(ok);
-  const byStratum = groupBy(ok, 'stratum');
-  const byDiff = groupBy(ok, 'difficulty');
+  // ── 把「待人工复核」的样本排除出主要指标（清单在最前面已加载）──
+  const effective = ok.filter((r) => !excludedIds.has(r.groundTruthId));
+  const excludedRows = ok.filter((r) => excludedIds.has(r.groundTruthId));
+
+  const overall = summarize(effective);
+  const byStratum = groupBy(effective, 'stratum');
+  const byDiff = groupBy(effective, 'difficulty');
 
   // 失败归因 —— 把未命中的用例拆成两类，这两类要修的地方完全不同
-  const recalled = ok.filter((r) => r.recallRank > 0);
-  const missed = ok.filter((r) => r.rank === 0);
+  const recalled = effective.filter((r) => r.recallRank > 0);
+  const missed = effective.filter((r) => r.rank === 0);
   const missByRecall = missed.filter((r) => r.recallRank === 0);      // 召回层就没捞到
   const missByRerank = missed.filter((r) => r.recallRank > 0);        // 捞到了但没挑中
+
+  // 本次跑的模型与生效的展示规则，取自后端在响应里的回显（任一成功行都带）。
+  // 记下来是为了让报告自证条件：历史报告没写模型，事后根本分不清哪份是哪个模型跑的。
+  const sample = rows.find((r) => !r.error) || {};
+  const runModel = sample.model ?? null;
+  const runMinScore = sample.minScore ?? null;
+  const runMaxResults = sample.maxResults ?? null;
+  const belowTotal = rows.reduce((s, r) => s + (r.belowThresholdCount || 0), 0);
+
+  if (!runModel) {
+    console.error('\n⚠️  后端没有回显 model —— 这份报告无法区分模型，别拿它和别的报告横比。');
+  }
+  if (runMinScore !== null && runMinScore > 0) {
+    // 主动匹配按设计不过滤（NO_SCORE_FILTER）。真触发说明有人给主动路径加了门槛 —— 得查。
+    console.error(`\n⚠️  本次 minScore=${runMinScore} —— 主动匹配本不该过滤分数，返回值已被裁剪。`);
+    console.error('   这份结果的分数分布是不完整的。请检查 AiServiceImpl#query 传的是不是 NO_SCORE_FILTER。');
+  }
 
   const md = [
     `# AI 物品匹配评测报告 — ${LABEL}`,
     '',
     `- 评测集：\`${DATASET}\`（${dataset.length} 条）`,
+    `- **模型**：${runModel ?? '⚠️ 未记录（后端未回显 model）'}`,
+    `- **筛选策略**：主动匹配 = 按分数降序取 Top-${runMaxResults ?? '?'}，**不设最低分门槛**` +
+      (runMinScore === 0 ? ' ✅' : `（⚠️ 本次回显 minScore=${runMinScore}，分数分布不完整）`),
+    `- 被门槛挡下的条数合计：${belowTotal}（主动匹配应为 0；逐条明细见 \`results-${LABEL}.jsonl\` 的 \`scores\` 字段）`,
     `- 执行时间：${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC，总耗时 ${wall}s`,
     `- 说明：每个用例只有一个标准答案，所以 Hit@K 等于 Recall@K`,
-    `- 参与统计：${ok.length} 条`,
+    `- 参与统计：${effective.length} 条`,
+    `- **有效样本：${effective.length} / ${dataset.length}**` +
+      (exclusion
+        ? `（排除 ${excludedRows.length} 条待人工复核的样本，逐条原因见 \`${EXCLUDE_FILE}\`）`
+        : '（未找到排除清单，全量统计）'),
+    '- ⚠️ **本报告是「干净评测环境」下的新基线**：跑在 lost_found_eval（只装 2000 条种子），' +
+      '而 `report-baseline` ~ `report-qwen-retry` 那批跑在主库、且早于压测数据入库 —— ' +
+      '池子规模差了 60 倍，**两组数字不可直接比较**。',
     `- **大模型降级率**：${((llmFailed.length / rows.length) * 100).toFixed(1)}%（${llmFailed.length} 条调用失败已剔除）` +
       (degradeRate > 0.05 ? ' 🔴 过高，供应商可用性存疑' : ''),
     `- 召回为空（正常路径）：${noCandidates.length} 条`,
@@ -247,10 +334,10 @@ async function main() {
     '',
     '| 失败类型 | 数量 | 占全部用例 | 该修哪里 |',
     '|---|---:|---:|---|',
-    `| 召回层没捞到 | ${missByRecall.length} | ${pct(missByRecall.length / ok.length)} | 改召回（换打分算法 / 扩 Top-K） |`,
-    `| 召回到了但精排没选中 | ${missByRerank.length} | ${pct(missByRerank.length / ok.length)} | 改精排（prompt / 候选表示 / 模型） |`,
+    `| 召回层没捞到 | ${missByRecall.length} | ${pct(missByRecall.length / effective.length)} | 改召回（换打分算法 / 扩 Top-K） |`,
+    `| 召回到了但精排没选中 | ${missByRerank.length} | ${pct(missByRerank.length / effective.length)} | 改精排（prompt / 候选表示 / 模型） |`,
     '',
-    `召回层总体成功率：**${pct(overall.recallRate)}**（${recalled.length}/${ok.length} 条标准答案进了候选列表）`,
+    `召回层总体成功率：**${pct(overall.recallRate)}**（${recalled.length}/${effective.length} 条标准答案进了候选列表）`,
     '',
     table('按候选池分层', byStratum),
     '',
@@ -264,7 +351,7 @@ async function main() {
     '',
   ];
 
-  const failed = ok.filter((r) => r.rank === 0).slice(0, 10);
+  const failed = effective.filter((r) => r.rank === 0).slice(0, 10);
   if (!failed.length) {
     md.push('（无）');
   } else {
@@ -292,4 +379,13 @@ async function main() {
   console.log(`\n报告已写入 eval/report-${LABEL}.md`);
 }
 
-main();
+// 接住异常：像「误连主库」这种是**故意的**拦截，应该打一句人话再退出，
+// 而不是甩一段 Node 调用栈让人以为是脚本崩了。
+//
+// ⚠️ 这里用 process.exitCode 而不是 process.exit(1)：后者会在 Windows 上
+// 触发 libuv 断言（"Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)"），
+// 因为 fetch 的连接还没排空就被强杀了 —— 退出码照样是 1，但会多打一段吓人的崩溃信息。
+main().catch((e) => {
+  console.error('\n🔴 ' + e.message);
+  process.exitCode = 1;
+});

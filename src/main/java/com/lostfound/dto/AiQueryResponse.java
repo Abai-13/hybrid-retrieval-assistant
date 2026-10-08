@@ -60,6 +60,30 @@ public class AiQueryResponse {
      */
     private String degradeReason;
 
+    /**
+     * 本次实际生效的最低分数门槛。
+     * <p><b>主动匹配恒为 0</b>（不过滤，见 AiServiceImpl#NO_SCORE_FILTER）；
+     * 自动匹配才是 80 那一档。回显它有两个用途：前端排查"为什么只有一条"时不用去翻服务器配置；
+     * 评测脚本可以把<b>当时真正生效的配置</b>记进报告 ——
+     * 而不是靠人记得在命令行里传对环境变量（历史报告里连用了哪个模型都没记，就是这么欠下的债）。
+     */
+    private int minScore;
+
+    /** 本次实际生效的最大展示条数 */
+    private int maxResults;
+
+    /**
+     * 大模型返回了、但因为分数低于 {@link #minScore} 而没有被采用的条数。
+     * <p>主动匹配恒为 0（不过滤）；自动匹配用它来说明"有几条被门槛挡在通知之外"。
+     * <p><b>没有这个字段就没法把话说准</b>：「一条都没匹配上」和「匹配上了但都没过线」
+     * 是完全不同的两件事，但都表现为 matches 为空。少了它，界面只能笼统说"没找到"，
+     * 用户会以为平台上一定没有自己的东西 —— 而事实可能只是分数差了一点。
+     */
+    private int belowThresholdCount;
+
+    /** 本次调用使用的大模型名，供评测记录（历史报告缺失模型信息，导致事后无法区分对照组） */
+    private String model;
+
     /** 大模型调用失败 */
     public static final String DEGRADE_LLM_ERROR = "LLM_ERROR";
     /** 召回为空，压根没调大模型（这是正常路径，不是故障） */

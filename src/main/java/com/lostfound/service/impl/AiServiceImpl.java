@@ -10,6 +10,7 @@ import com.lostfound.dto.MatchResult;
 import com.lostfound.entity.Item;
 import com.lostfound.service.AiService;
 import com.lostfound.service.CandidateService;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,6 +54,83 @@ public class AiServiceImpl implements AiService {
      */
     @Value("${llm.max-retries:2}")
     private int maxRetries;
+
+    /**
+     * 主动匹配最多返回几条（用户在 AI 页输入描述）。
+     * <p>prompt 里也写了 5，这里再夹一道，不把展示条数交给模型自觉。
+     */
+    @Value("${ai.match.interactive.max-results:5}")
+    private int interactiveMaxResults;
+
+    /**
+     * 自动匹配的最低分门槛（物品发布后由系统自动跑，用于站内通知）。
+     * <p>⚠️ <b>主动匹配不使用这个值</b> —— 见 {@link #NO_SCORE_FILTER}。
+     * <p>目前还没有代码读它：功能尚未开发，先把策略和配置预留出来。
+     */
+    @Value("${ai.match.auto.min-score:80}")
+    private int autoMatchMinScore;
+
+    /** 自动匹配最多进几条通知 */
+    @Value("${ai.match.auto.max-results:5}")
+    private int autoMatchMaxResults;
+
+    /**
+     * 主动匹配不做分数过滤。
+     *
+     * <p>为什么主动匹配不设门槛：这个场景是<b>用户主动来找东西</b> ——
+     * 他描述完就在等结果，多给他看一条让他自己判断，远比"替他筛掉"安全；
+     * 漏报的代价（他以为平台上没有，就此放弃）远大于误报（他扫一眼发现不像）。
+     * 而且模型的 score 是自己写的 0~100 整数，<b>没有被校准过</b>，
+     * 拿它当"质量闸门"本身就没有依据。
+     *
+     * <p>分数门槛留给自动匹配 —— 那边是系统主动推给用户，多推一条就是一次打扰。
+     */
+    private static final int NO_SCORE_FILTER = 0;
+
+    /** 展示条数的上限。与 prompt 里的「最多 5 个」保持一致 */
+    private static final int MAX_ALLOWED_RESULTS = 5;
+
+    /**
+     * 启动时校验两套筛选策略的配置 —— <b>配置不合法就直接起不来，绝不静默钳位</b>。
+     *
+     * <p>为什么不做"悄悄夹到合法范围"：那样配置文件写着 150，程序却按 100 跑、
+     * 或者写着 -5 却按 0 跑，<b>看代码的人和看配置的人会得出两个不同的结论</b>。
+     * 更糟的是门槛写成 `800`（手滑多打一个 0）会安静地让自动匹配永远不发通知 ——
+     * 而"没有通知"看起来太像一个正常业务结果了，没人会去怀疑是配置写错了。
+     *
+     * <p>自动匹配的两个键目前还没有代码读 —— <b>照样校验</b>：配置写在文件里却没人读时，
+     * 写错了会静默存续到功能上线那天，那才是最贵的。
+     *
+     * <p>抛的是 {@link IllegalStateException}，Spring 会中止启动并把消息原样打出来，
+     * 而且<b>一次报全部问题</b>，不用改一个重启一次。
+     */
+    @PostConstruct
+    void validateMatchRules() {
+        List<String> errors = new ArrayList<>();
+        if (interactiveMaxResults < 1 || interactiveMaxResults > MAX_ALLOWED_RESULTS) {
+            errors.add("ai.match.interactive.max-results 必须在 1~" + MAX_ALLOWED_RESULTS
+                    + " 之间，当前值：" + interactiveMaxResults);
+        }
+        if (autoMatchMinScore < 0 || autoMatchMinScore > 100) {
+            errors.add("ai.match.auto.min-score 必须在 0~100 之间（0 表示不过滤），当前值：" + autoMatchMinScore);
+        }
+        if (autoMatchMaxResults < 1 || autoMatchMaxResults > MAX_ALLOWED_RESULTS) {
+            errors.add("ai.match.auto.max-results 必须在 1~" + MAX_ALLOWED_RESULTS
+                    + " 之间，当前值：" + autoMatchMaxResults);
+        }
+        // ⚠️ 自动匹配是在主动匹配拿到的结果之上再筛的（它复用的就是 AiService#query），
+        //    所以自动的条数上限不可能超过主动的 —— 配反了会让自动匹配永远吃不饱，
+        //    而且表现出来只是"通知少了"，查起来很费劲。直接在启动时拦住。
+        if (interactiveMaxResults < autoMatchMaxResults) {
+            errors.add("ai.match.interactive.max-results（" + interactiveMaxResults
+                    + "）不能小于 ai.match.auto.max-results（" + autoMatchMaxResults
+                    + "）—— 自动匹配复用主动匹配的结果，后者是前者的上限");
+        }
+        if (!errors.isEmpty()) {
+            throw new IllegalStateException("AI 匹配筛选策略配置不合法：\n  - "
+                    + String.join("\n  - ", errors));
+        }
+    }
 
     /** 系统提示：限制 AI 只回答失物招领相关问题 */
     private static final String SYSTEM_PROMPT =
@@ -121,18 +199,33 @@ public class AiServiceImpl implements AiService {
         return call.content();
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * 只负责「召回 + 交给精排」，<b>本身不做任何筛选</b> —— 筛选是策略层的事
+     * （主动匹配不过滤、自动匹配用门槛）。
+     */
     @Override
     public AiQueryResponse query(String question) {
-        long start = System.currentTimeMillis();
         log.info("AI 物品匹配请求: {}", question);
-
         // ① 召回候选物品 —— 从「最近发布的 30 条」改成「全量 + 2-gram 打分取 Top-K」
-        List<Item> candidates = candidateService.recall(question, recallTopK);
+        return matchAgainst(question, candidateService.recall(question, recallTopK));
+    }
+
+    @Override
+    public AiQueryResponse matchAgainst(String question, List<Item> candidates) {
+        long start = System.currentTimeMillis();
 
         AiQueryResponse result = new AiQueryResponse();
         result.setCandidateCount(candidates.size());
         result.setCandidateIds(candidates.stream().map(Item::getId).toList());
         result.setMatches(List.of());
+        // 回显"本次用的什么模型、生效的展示规则"—— 降级路径也要带上，
+        // 否则评测记录不到这一轮的对照条件（历史报告缺失模型信息就是这么来的）
+        result.setModel(llmConfig.getModel());
+        // 回显**本次实际生效的**策略：主动匹配一律不过滤，所以最低分恒为 0
+        result.setMinScore(NO_SCORE_FILTER);
+        result.setMaxResults(interactiveMaxResults);
 
         // ② 一个候选都没有时，别调大模型 —— 白花一次 token 和 1 秒延迟。
         //    模型面对空列表只有两种反应：说「没找到」，或者开始编。
@@ -168,8 +261,20 @@ public class AiServiceImpl implements AiService {
         // ④ 解析 JSON 并回填本地字段
         try {
             JSONObject json = JSONUtil.parseObj(call.content());
-            result.setAnswer(json.getStr("answer", ""));
-            result.setMatches(toMatchResults(json.getJSONArray("matches"), candidates));
+            List<MatchResult> all = toMatchResults(json.getJSONArray("matches"), candidates);
+            // 主动匹配：按分数降序取 Top-N，**不做最低分过滤**（见 NO_SCORE_FILTER 的说明）
+            DisplaySelection selection = applyDisplayRules(all, NO_SCORE_FILTER, interactiveMaxResults);
+            result.setMatches(selection.shown());
+            result.setBelowThresholdCount(selection.belowThreshold());
+
+            // ⑤ 只有确实裁剪过才重写 answer。
+            //    模型的"一句话总结"是基于**过滤前**的 matches 写的，裁剪之后就自相矛盾了
+            //    （卡片显示 1 条、总结里写着"找到 3 条"）。没裁剪时它和自己的结果一致，保留原文更自然。
+            if (selection.shown().size() < all.size()) {
+                result.setAnswer(buildDisplayAnswer(selection.shown().size(), selection.belowThreshold()));
+            } else {
+                result.setAnswer(json.getStr("answer", ""));
+            }
         } catch (Exception e) {
             // 大模型偶尔不按格式返回（最常见的是套一层 ```json 代码块围栏）。
             // 解析失败不能让整个接口挂掉 —— 把原文塞进 answer，前端至少还能显示。
@@ -275,7 +380,7 @@ public class AiServiceImpl implements AiService {
      *       不用大模型返回的 —— 它只负责判断「哪条最像」，回填是我们的事。</li>
      * </ol>
      */
-    private List<MatchResult> toMatchResults(JSONArray arr, List<Item> candidates) {
+    static List<MatchResult> toMatchResults(JSONArray arr, List<Item> candidates) {
         if (arr == null || arr.isEmpty()) {
             return List.of();
         }
@@ -302,13 +407,106 @@ public class AiServiceImpl implements AiService {
             r.setTitle(item.getTitle());
             r.setCategory(item.getCategory());
             r.setLocation(item.getLocation());
-            r.setScore(m.getInt("score", 0));
+            r.setScore(parseScore(m, item.getId()));
             r.setReason(m.getStr("reason", ""));
             list.add(r);
         }
 
         list.sort(Comparator.comparingInt(MatchResult::getScore).reversed());
         return list;
+    }
+
+    /**
+     * 解析模型给的 score，并**把异常情况记进日志、不静默吞掉**。
+     *
+     * <p>为什么不能就这么写 {@code getInt("score", 0)}：那样"模型没填"和"模型给了 0 分"
+     * 长得一模一样。加了最低分过滤之后，一条本可以展示的结果会因为缺个字段而无声消失，
+     * 用户和我们都不会知道 —— 这正是这个项目反复踩过的同一类坑：
+     * 降级/异常可以容忍，但<b>不能不可观测</b>。
+     *
+     * <p>缺失或非法的 score 一律按 0 处理（宁可少展示一条，也不要拿脏数据当高分），
+     * 但会留下 warn 日志和 {@code belowThresholdCount} 上的痕迹。
+     */
+    private static int parseScore(JSONObject m, Long itemId) {
+        Object raw = m.get("score");
+        if (raw == null) {
+            log.warn("大模型未返回 score 字段，按 0 分处理: itemId={}", itemId);
+            return 0;
+        }
+        Integer value = null;
+        if (raw instanceof Number n) {
+            value = n.intValue();
+        } else {
+            try {
+                value = Integer.parseInt(String.valueOf(raw).trim());
+            } catch (NumberFormatException ignored) {
+                // 落到下面统一记日志
+            }
+        }
+        if (value == null || value < 0 || value > 100) {
+            log.warn("大模型返回的 score 非法，按 0 分处理: itemId={}, score={}", itemId, raw);
+            return 0;
+        }
+        return value;
+    }
+
+    /** 展示筛选的结果：给用户看的列表 + 因为分数不够被挡下的条数 */
+    record DisplaySelection(List<MatchResult> shown, int belowThreshold) {
+    }
+
+    /**
+     * 展示规则 —— 先按最低分过滤，再截断条数。<b>不重新排序</b>。
+     *
+     * <p>为什么顺序不能动：入参已经按分数降序排好（{@link #toMatchResults} 排的）。
+     * 保持这个顺序有两个后果：① 前端拿到的就是"最像的在前"；
+     * ② 阈值过滤等价于<b>保留列表的前缀</b> —— 而实测数据显示正确答案有约 85% 排在第一位，
+     * 所以只要还有一条过线，正确结果几乎不会被误伤。风险集中在"一条都不剩"，不在"砍掉了尾巴"。
+     *
+     * <p>抽成 static 纯函数是为了能单测 —— AI 链路原本一个单元测试都没有，
+     * 只有 146 条评测兜着，而评测要花钱、跑得慢、还不能断言边界（79/80/81）。
+     *
+     * <p>⚠️ <b>这里不做任何钳位</b>：`minScore` / `maxResults` 的合法性由
+     * {@link #validateMatchRules()} 在启动时把关，非法配置根本进不来。
+     * 函数只负责按规则执行，不再"偷偷纠正"调用方 —— 两处都改一半，才最容易出对不上的口径。
+     *
+     * @param minScore   0~100（0 表示关闭过滤），调用方已保证
+     * @param maxResults 1~{@value #MAX_ALLOWED_RESULTS}，调用方已保证
+     */
+    static DisplaySelection applyDisplayRules(List<MatchResult> all, int minScore, int maxResults) {
+        if (all == null || all.isEmpty()) {
+            return new DisplaySelection(List.of(), 0);
+        }
+        List<MatchResult> passed = all.stream()
+                .filter(m -> m.getScore() != null && m.getScore() >= minScore)
+                .toList();
+        int belowThreshold = all.size() - passed.size();
+        List<MatchResult> shown = passed.size() <= maxResults ? passed : passed.subList(0, maxResults);
+        return new DisplaySelection(List.copyOf(shown), belowThreshold);
+    }
+
+    /**
+     * 裁剪过结果之后，由后端自己生成一句和实际展示完全对得上的话。
+     *
+     * <p>三种情况，措辞都不能含糊：
+     * <ul>
+     *   <li><b>有结果</b>：直接说找到几条，不夸大；</li>
+     *   <li><b>有结果但都被门槛挡下</b>：说"暂未发现高度匹配的物品"，并说明还有几条相似度低的 ——
+     *       <b>绝不能写成"没有匹配的物品"</b>，那会让用户以为平台上一定没有自己的东西而直接放弃，
+     *       而失物招领场景里"用户因为没看到而放弃"正是最贵的损失。
+     *       （主动匹配不过滤，所以这一支目前只有自动匹配会走到）</li>
+     *   <li><b>模型确实一条都没返</b>：给兜底引导。</li>
+     * </ul>
+     */
+    private static String buildDisplayAnswer(int shownCount, int belowThreshold) {
+        if (shownCount > 0) {
+            return "为你找到 " + shownCount + " 条匹配度较高的招领信息，"
+                    + "点开可以看详情、申请认领。";
+        }
+        if (belowThreshold > 0) {
+            return "暂未发现高度匹配的物品。另外有 " + belowThreshold + " 条相似度较低的结果，"
+                    + "可以补充颜色、品牌型号、丢失地点或一眼能认出的特征后，换个说法再试试。";
+        }
+        return "没有匹配到招领信息。可以换个说法再试试，或者直接去失物招领处登记一下。";
     }
 
     /**

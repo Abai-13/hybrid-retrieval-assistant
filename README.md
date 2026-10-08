@@ -12,8 +12,10 @@
 
 - 用户注册 / 登录（JWT 认证 + BCrypt 密码加密）
 - 物品发布（**含图片上传**）、分页搜索（按类型 / 分类 / 关键词 / 时间排序）、详情查看
-- 物品状态修改（未认领 → 已认领），服务端二次校验发布者身份，防止改他人帖子
-- 个人中心：我的发布列表
+- **认领闭环**：失主提交认领申请并附物品特征证明 → 拾到者审核（通过 / 驳回，驳回需理由）→
+  线下核对交接 → 失主确认收到，物品才转为「已认领」。全过程写入 `claim_log`，
+  申请详情页可按时间线复盘每一步；归还完成后同一物品上其他申请自动关闭
+- 个人中心：我的发布列表 / 我的认领申请（含「确认收到」入口）/ 我收到的申请（审核台）
 - AI 智能问答：自由提问
 - **AI 物品匹配**：用自然语言描述丢失的东西（如「我的黑色苹果手机不见了」）→ 匹配库里的招领信息，返回结构化结果 + 匹配理由
 
@@ -200,9 +202,21 @@ cd frontend && npm install && npm run dev    # http://localhost:5173
 | GET | `/api/item` | — | 物品列表（分页 + 筛选 + 排序） |
 | GET | `/api/item/{id}` | — | 物品详情 |
 | GET | `/api/item/my` | ✅ | 我的发布 |
-| PUT | `/api/item/{id}/status` | ✅ | 修改物品状态（仅发布者） |
+| PUT | `/api/item/{id}/status` | ✅ | **撤销「已认领」**（仅发布者，只允许 `CLAIMED → UNCLAIMED`） |
 | POST | `/api/ai/chat` | ✅ | AI 问答 |
 | POST | `/api/ai/query` | ✅ | AI 物品匹配 |
+| POST | `/api/claim` | ✅ | 提交认领申请（含特征证明） |
+| GET | `/api/claim/my` | ✅ | 我发起的认领申请 |
+| GET | `/api/claim/received` | ✅ | 我收到的认领申请（审核台） |
+| GET | `/api/claim/{id}` | ✅ | 申请详情 + 流转时间线（仅当事人） |
+| POST | `/api/claim/{id}/approve` | ✅ | 审核通过 |
+| POST | `/api/claim/{id}/reject` | ✅ | 驳回（理由必填） |
+| POST | `/api/claim/{id}/cancel` | ✅ | 撤回尚未审核的申请 |
+| POST | `/api/claim/{id}/complete` | ✅ | 确认收到物品 → 物品转「已认领」 |
+| GET | `/api/notification/my` | ✅ | 我的站内通知（分页，内联匹配明细） |
+| GET | `/api/notification/unread-count` | ✅ | 未读条数（角标用） |
+| PUT | `/api/notification/{id}/read` | ✅ | 标记单条已读（仅本人） |
+| PUT | `/api/notification/read-all` | ✅ | 全部标记已读 |
 
 **认证方式：** 登录后拿到 token，请求头加 `Authorization: Bearer <token>`。
 
@@ -226,6 +240,7 @@ lost-found/
 │   ├── config/
 │   │   ├── JwtConfig.java / JwtUtil.java      # JWT 配置与工具
 │   │   ├── WebConfig.java                     # CORS + 拦截器 + 静态资源映射
+│   │   ├── AsyncConfig.java                   # 自动匹配用的有界线程池（@EnableAsync）
 │   │   ├── LlmConfig.java                     # 大模型配置（供应商可切换）
 │   │   ├── EmbeddingConfig.java               # 向量服务配置
 │   │   ├── RedisConfig.java                   # 缓存序列化（注册 JavaTimeModule）
@@ -235,8 +250,11 @@ lost-found/
 │   │   └── MyMetaObjectHandler.java           # 时间字段自动填充
 │   ├── controller/                      # 接口层
 │   ├── service/                         # 业务层
-│   │   ├── CandidateService.java        # 候选召回（2-gram 打分）
-│   │   ├── EmbeddingService.java        # 向量化抽象（当前实现：云端 bge-m3）
+│   │   ├── CandidateService.java        # 候选召回（2-gram 打分，可指定招领/失物池）
+│   │   ├── ClaimService.java            # 认领闭环：状态机 + 流转日志 + 审核/撤回/确认收到
+│   │   ├── AutoMatchService.java        # 发布后自动匹配（开关门面）+ AutoMatchRunner（异步执行体）
+│   │   ├── NotificationService.java     # 站内通知：生成 / 列表 / 已读
+│   │   ├── EmbeddingService.java        # 向量化抽象（当前实现：云端 bge-m3，未接入召回）
 │   │   └── …                            # Item / User / Ai / File
 │   ├── mapper/  entity/  dto/           # 数据访问 / 表映射 / 请求响应对象
 │   └── interceptor/JwtInterceptor.java  # JWT 鉴权
@@ -284,6 +302,40 @@ lost-found/
 
 索引：`idx_created_at`（分页默认按时间倒序）、`idx_type`、`idx_category`、`idx_status`、`idx_user_id`。
 
+### claim_application 表（认领申请）
+
+`id` / `item_id` / `applicant_id` / `owner_id`（冗余自 `item.user_id`）/ `proof_text`（**特征证明**）/
+`proof_image` / `contact` / `status` / `reject_reason` / `reviewed_at` / `completed_at` /
+`active_flag`、`approved_flag`（**生成列**）/ `version` / `created_at` / `updated_at`。
+
+状态：`PENDING`（待审核）→ `APPROVED`（已通过）/ `REJECTED`（已驳回）/ `CANCELLED`（已撤回）；
+`APPROVED` → `COMPLETED`（已完成归还）。
+
+两个生成列配合唯一键表达「有条件的唯一」：同一人对同一物品只能有一条**活跃**申请
+（被驳回后可以重新申请），同一物品最多只能有一条**已通过**的申请。
+
+### claim_log 表（状态流转日志）
+
+`id` / `claim_id` / `from_status` / `to_status` / `operator_id` / `operator_role`（APPLICANT / OWNER / SYSTEM）/
+`remark` / `created_at`。**只追加，永不修改** —— 认领详情页的时间线就是它的顺序读出。
+
+更完整的状态机、权限规则、并发与缓存一致性说明见 [`CLAUDE.md`](./CLAUDE.md) 的「认领闭环」一节。
+
+### notification / notification_match 表（站内通知）
+
+**`notification`（主表）**：`id` / `receiver_id`（收件人，恒为失物主人）/ `source_item_id`（触发这次匹配的物品，即本次发布的那条）/
+`content`（汇总文案快照）/ `is_read` / `read_at` / `created_at`。
+唯一键 **`uk_source_receiver(source_item_id, receiver_id)`** —— 「一次发布 + 一个收件人 = 至多一条」，去重靠它。
+
+**`notification_match`（明细表）**：`id` / `notification_id` / `lost_item_id` / `found_item_id` / `score` / `reason` / `created_at`。
+一条汇总通知可以带多条匹配明细，每行指向**一个确定的 itemId**，并带上分数与匹配理由，点开就能看到具体是哪些、像在哪。
+唯一键 `uk_notification_pair(notification_id, lost_item_id, found_item_id)`。
+
+> 两张表的关系是 1:N —— 这不是额外复杂度，而是"一条通知带 N 个匹配"这件事本身的形状：
+> 塞进主表只能靠 JSON 列或逗号拼接，前者项目里没有先例，后者没法校验也没法查询。
+
+发布后自动匹配的触发时机、异步执行、开关与类别守卫见 [`CLAUDE.md`](./CLAUDE.md) 的「发布后自动匹配与站内通知」一节。
+
 ---
 
 ## 设计决策
@@ -316,6 +368,9 @@ lost-found/
 | 09-15 | 修 Redis 序列化 bug（`LocalDateTime` 未注册 `JavaTimeModule`，缓存写入一直失败却被降级吞掉）；补 `created_at` / `category` 索引 |
 | 09-15 | 前端整体美化（卡片列表 / 聊天气泡 / 统一主题）+ 个人中心页面 |
 | 09-16 | **压测**：12.8 万行数据下定位深分页瓶颈，延迟关联优化（SQL 100×、端到端 10×）+ 并发梯度测试 |
+| 10-08 | **认领闭环**：申请 / 特征证明 / 审核 / 驳回 / 撤回 / 确认收到全链路；状态机 + 流转日志表；生成列唯一键兜底并发；归还后自动关闭其他申请；联系方式按身份收敛；审核台与「我的申请」两个新页面 |
+| 10-08 | **AI 匹配筛选策略拆分**：主动匹配恢复「Top5、不设最低分」；80 分门槛下移到自动匹配（`ai.match.interactive.*` / `ai.match.auto.*` 两套独立配置）；评测环境隔离到 `lost_found_eval` |
+| 10-08 | **发布后自动匹配 + 站内通知**：两个方向（失物→招领、招领→失物）；异步执行不阻塞发布、异常隔离；汇总通知（一条通知带 N 条匹配明细）；总开关 `ai.match.auto.enabled`；类别守卫 |
 
 ---
 
@@ -325,3 +380,12 @@ lost-found/
 - 限流器是内存实现：Map 的 key 从不清理（长时间运行会缓慢泄漏），且多实例部署时各算各的
 - 向量化能力已实现但**尚未接入召回链路**（当前召回用 2-gram 打分，效果已达 95.2% 召回率）
 - Docker 配置已写好（多阶段构建 + compose 三服务），但**尚未在真实环境验证过**
+- **发布后自动匹配 + 站内通知**：物品发布成功后由后台**异步**跑一遍匹配，够格就给可能的主人发站内通知。
+  两个方向都支持 —— 发布失物时匹配已有招领（通知发布者本人），发布招领时**反向**匹配已有失物
+  （按失主分组，每位失主对同一次发布最多收到**一条汇总通知**，里面带上匹配到的全部条目：分数 + 理由 + 跳转）。
+  - 与主动匹配**共用召回与精排**，但**筛选策略独立**：自动场景用分数门槛（`ai.match.auto.min-score`）
+    压掉无关通知，主动场景不设门槛（用户主动来找，漏报的代价更大）
+  - 有总开关 `ai.match.auto.enabled`（默认 true）：关掉后发布照常成功，但**不提交任务、不调模型、不发通知**
+  - 类别守卫：失物与招领类别**明确不一致**时默认不通知；任一边是「其他」这类泛分类时交给大模型按文本判断
+- **评测环境已隔离**：压测数据（12.6 万条）与评测种子（2000 条）分库存放，
+  评测跑在 `lost_found_eval` 上，详见 `eval/setup-eval-db.sh` 与 `application-eval.yml`

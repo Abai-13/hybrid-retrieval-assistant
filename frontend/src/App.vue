@@ -1,16 +1,43 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { auth } from './api/auth'
+import request from './api/request'
 
 const router = useRouter()
 const route = useRoute()
+
+// ── 未读通知角标 ─────────────────────────────────────────────
+// 不做轮询、不用 WebSocket：进站拉一次 + 每次切换路由拉一次就够。
+// 通知的来源是"自己发布物品后系统自动匹配"，那是低频事件，
+// 为它挂一个常驻轮询不划算。
+const unread = ref(0)
+
+async function loadUnread() {
+  if (!auth.isLogin) {
+    unread.value = 0
+    return
+  }
+  try {
+    const res = await request.get('/notification/unread-count')
+    unread.value = res.data?.count ?? 0
+  } catch {
+    // 角标拉不到不能影响页面本身 —— 它只是个提示，不是主流程
+    unread.value = 0
+  }
+}
+
+onMounted(loadUnread)
+// 去通知页把消息读掉之后，回到别的页面角标要跟着清零
+watch(() => route.path, loadUnread)
 
 // 导航项集中定义，模板里 v-for 渲染 —— 加一个页面只改这一处
 const navs = [
   { path: '/items', label: '物品列表', icon: 'Grid' },
   { path: '/publish', label: '发布物品', icon: 'Plus' },
   { path: '/ai', label: 'AI 助手', icon: 'MagicStick' },
+  { path: '/claims/my', label: '我的申请', icon: 'Postcard' },
+  { path: '/claims/received', label: '收到的申请', icon: 'Tickets' },
 ]
 
 // 详情页 /items/3 也应该让「物品列表」保持高亮
@@ -50,6 +77,18 @@ function logout() {
         </nav>
 
         <div class="right">
+          <!-- 通知不做成第 6 个导航项（那一排已经够挤了），放用户区更贴近"给我个人的消息" -->
+          <div
+            v-if="auth.isLogin"
+            class="bell"
+            title="站内通知"
+            @click="router.push('/notifications')"
+          >
+            <el-badge :value="unread" :hidden="!unread" :max="99">
+              <el-icon :size="18"><Bell /></el-icon>
+            </el-badge>
+          </div>
+
           <el-button v-if="!auth.isLogin" type="primary" @click="router.push('/login')">
             登录 / 注册
           </el-button>
@@ -174,6 +213,25 @@ function logout() {
 
 .right {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.bell {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  color: var(--lf-text-sub);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.bell:hover {
+  background: #f2f3f7;
+  color: var(--lf-text);
 }
 
 .user {

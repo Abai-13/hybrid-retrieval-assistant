@@ -1,0 +1,35 @@
+# ============================================================
+# 评测专用 Profile —— 让 AI 评测跑在一个只装「评测种子」的干净库上。
+#
+# 为什么要有它：主库 lost_found 里 128064 条物品中，只有 2000 条是评测种子，
+# 另外 126063 条是性能压测数据（id 393212~520726）。压测数据与种子共用物品模板，
+# 导致**每一条评测物品在主库里都能找到字段完全相同的克隆体** ——
+# 标准答案无法判定，指标失去意义（详见 docs/technical-note 与 eval/excluded-samples.json）。
+#
+# ⚠️ 这个 profile **不碰主库**：只换连接目标，不动任何业务代码。
+#    回滚：删掉 lost_found_eval 库、用默认 profile 启动即可。
+# ============================================================
+
+server:
+  # 与主库后端并存，端口错开
+  port: 8081
+
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/lost_found_eval?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+
+  # ⚠️ Redis 必须换一个逻辑库（DB index），否则两个后端会撞缓存。
+  #    缓存 key（foundPool / lostPool / itemDetail / itemPage / itemMypage）在两边完全同名，
+  #    却指向不同的数据库 —— 会出现「拿主库的缓存回答评测库的请求」，
+  #    而且因为缓存写的是 JSON、读得出来，**不会报错，只会静默给出错误结果**。
+  #
+  #    属性名用的是 Spring Boot 3 的新前缀 spring.data.redis.*（本项目 application.yml
+  #    用的就是这个），并且 RedisConfig 里的 cacheManager/redisTemplate 注入的是
+  #    自动配置的 RedisConnectionFactory —— 所以 database 这一项**确实会生效**。
+  #
+  #    为什么是 5 而不是 1：这个 Redis 实例（支持 16 个逻辑库）**还有别的应用在用**，
+  #    DB1 里发现过一个不属于本项目的 key（foodCategoryList）。换个更靠后的空库，
+  #    撞名的概率更低。选之前已确认 DB5 是空的（DBSIZE = 0）。
+  data:
+    redis:
+      database: 5

@@ -38,6 +38,19 @@ public class CandidateServiceImpl implements CandidateService {
 
     @Override
     public List<Item> recall(String query, int topK) {
+        return recall(query, Item.TYPE_FOUND, topK);
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * 池子由 {@code poolType} 决定：{@code FOUND} = 失物描述找招领（主动匹配、发布失物后自动匹配）；
+     * {@code LOST} = 招领描述找失物（发布招领后反向匹配）。
+     * <b>打分算法一个字都没改</b> —— 两边都是"一段自然语言描述 vs 一批候选物品的文本"，
+     * 对称的，换个池子就够。
+     */
+    @Override
+    public List<Item> recall(String query, String poolType, int topK) {
         Set<String> queryGrams = bigrams(query);
         if (queryGrams.isEmpty()) {
             return List.of();
@@ -46,7 +59,9 @@ public class CandidateServiceImpl implements CandidateService {
         long start = System.currentTimeMillis();
         // 走 ItemService 而不是直接查 Mapper：全量候选列表带缓存，
         // 每次 AI 请求都扫一遍 1000 行数据库没必要
-        List<Item> pool = itemService.listUnclaimedFound();
+        List<Item> pool = Item.TYPE_LOST.equals(poolType)
+                ? itemService.listUnclaimedLost()
+                : itemService.listUnclaimedFound();
 
         List<Scored> scored = new ArrayList<>(pool.size());
         for (Item item : pool) {
@@ -60,8 +75,8 @@ public class CandidateServiceImpl implements CandidateService {
         scored.sort(Comparator.comparingDouble(Scored::score).reversed());
 
         List<Item> top = scored.stream().limit(topK).map(Scored::item).toList();
-        log.info("召回: 候选池 {} 条 → 有重合 {} 条 → 取 Top{}，实际返回 {} 条，耗时 {} ms",
-                pool.size(), scored.size(), topK, top.size(), System.currentTimeMillis() - start);
+        log.info("召回[{}池]: 候选池 {} 条 → 有重合 {} 条 → 取 Top{}，实际返回 {} 条，耗时 {} ms",
+                poolType, pool.size(), scored.size(), topK, top.size(), System.currentTimeMillis() - start);
         return top;
     }
 
