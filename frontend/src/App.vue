@@ -35,7 +35,9 @@ watch(() => route.path, loadUnread)
 const navs = [
   { path: '/items', label: '物品列表', icon: 'Grid' },
   { path: '/publish', label: '发布物品', icon: 'Plus' },
-  { path: '/ai', label: 'AI 助手', icon: 'MagicStick' },
+  // 页面里只剩一个模式了（原来的「AI 问答 / AI 物品匹配」二选一已合并），
+  // 导航名跟着改，免得用户点进来还在找另一个入口
+  { path: '/ai', label: '找物助手', icon: 'MagicStick' },
   { path: '/claims/my', label: '我的申请', icon: 'Postcard' },
   { path: '/claims/received', label: '收到的申请', icon: 'Tickets' },
 ]

@@ -12,6 +12,7 @@ import com.lostfound.service.AutoMatchService;
 import com.lostfound.service.ClaimService;
 import com.lostfound.service.FileService;
 import com.lostfound.service.ItemService;
+import com.lostfound.service.ItemVectorService;
 import com.lostfound.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
@@ -35,6 +36,8 @@ public class ItemController {
     private final ClaimService claimService;
     /** 发布成功后触发后台自动匹配（异步） */
     private final AutoMatchService autoMatchService;
+    /** 发布成功后异步写入向量（异步，失败只记日志，可补齐修复） */
+    private final ItemVectorService itemVectorService;
 
     /**
      * 发布物品（需登录，支持图片上传）。
@@ -66,6 +69,15 @@ public class ItemController {
         } catch (Exception e) {
             // 兜底：自动匹配的任何问题都不能影响"发布成功"这个结果
             log.warn("触发自动匹配失败（不影响发布）: itemId={}", item.getId(), e);
+        }
+
+        // 同样在 insert 已提交之后触发向量写入 —— 异步、失败只记日志。
+        // 和自动匹配分开 try/catch：一个是"有没有提醒到人"，一个是"有没有进向量库"，
+        // 两件事各自的失败原因要能在日志里分清，不能合用一句 catch 混掉。
+        try {
+            itemVectorService.triggerAfterPublish(item);
+        } catch (Exception e) {
+            log.warn("触发向量写入失败（不影响发布，可运行补齐命令修复）: itemId={}", item.getId(), e);
         }
         return Result.ok("发布成功", item);
     }

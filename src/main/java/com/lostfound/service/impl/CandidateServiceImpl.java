@@ -1,5 +1,6 @@
 package com.lostfound.service.impl;
 
+import com.lostfound.common.ItemTexts;
 import com.lostfound.entity.Item;
 import com.lostfound.service.CandidateService;
 import com.lostfound.service.ItemService;
@@ -38,7 +39,12 @@ public class CandidateServiceImpl implements CandidateService {
 
     @Override
     public List<Item> recall(String query, int topK) {
-        return recall(query, Item.TYPE_FOUND, topK);
+        return recall(query, Item.TYPE_FOUND, topK, Set.of());
+    }
+
+    @Override
+    public List<Item> recall(String query, String poolType, int topK) {
+        return recall(query, poolType, topK, Set.of());
     }
 
     /**
@@ -50,10 +56,15 @@ public class CandidateServiceImpl implements CandidateService {
      * 对称的，换个池子就够。
      */
     @Override
-    public List<Item> recall(String query, String poolType, int topK) {
+    public List<Item> recall(String query, String poolType, int topK, Set<Long> excludeIds) {
+        return recallDetailed(query, poolType, topK, excludeIds).candidates();
+    }
+
+    @Override
+    public RecallResult recallDetailed(String query, String poolType, int topK, Set<Long> excludeIds) {
         Set<String> queryGrams = bigrams(query);
         if (queryGrams.isEmpty()) {
-            return List.of();
+            return new RecallResult(List.of(), 0, 0);
         }
 
         long start = System.currentTimeMillis();
@@ -63,8 +74,19 @@ public class CandidateServiceImpl implements CandidateService {
                 ? itemService.listUnclaimedLost()
                 : itemService.listUnclaimedFound();
 
+        Set<Long> excluded = excludeIds == null ? Set.of() : excludeIds;
+        int excludedCount = 0;
         List<Scored> scored = new ArrayList<>(pool.size());
         for (Item item : pool) {
+            // 排除项在打分**之前**就剔掉，不是取完 Top-K 再删。
+            // 先截断后删除会让用户少拿到一条本可以补上来的结果 ——
+            // 他说的是"再找找"，不是"少给我一条"。
+            // 排除键是 itemId 而不是文本：用户否掉的是**这条物品**，
+            // 不是"所有标题长这样的物品"。
+            if (excluded.contains(item.getId())) {
+                excludedCount++;
+                continue;
+            }
             double score = coverage(queryGrams, bigrams(docText(item)));
             // 分数为 0 说明和用户描述一个字都不重合，纯噪音。
             // 塞进 prompt 只会浪费 token 并分散模型注意力，直接丢掉。
@@ -75,9 +97,10 @@ public class CandidateServiceImpl implements CandidateService {
         scored.sort(Comparator.comparingDouble(Scored::score).reversed());
 
         List<Item> top = scored.stream().limit(topK).map(Scored::item).toList();
-        log.info("召回[{}池]: 候选池 {} 条 → 有重合 {} 条 → 取 Top{}，实际返回 {} 条，耗时 {} ms",
-                poolType, pool.size(), scored.size(), topK, top.size(), System.currentTimeMillis() - start);
-        return top;
+        log.info("召回[{}池]: 候选池 {} 条 → 按用户排除 {} 条 → 有重合 {} 条 → 取 Top{}，实际返回 {} 条，耗时 {} ms",
+                poolType, pool.size(), excludedCount, scored.size(), topK, top.size(),
+                System.currentTimeMillis() - start);
+        return new RecallResult(top, pool.size(), excludedCount);
     }
 
     // ===================== 打分 =====================
@@ -129,16 +152,12 @@ public class CandidateServiceImpl implements CandidateService {
         return (double) hit / queryGrams.size();
     }
 
-    /** 参与匹配的文本 —— 和喂给大模型的字段保持一致，避免「召回用的信息模型看不到」 */
+    /**
+     * 参与匹配的文本 —— 和喂给大模型的字段保持一致，避免「召回用的信息模型看不到」。
+     * <p>拼法已抽到 {@link com.lostfound.common.ItemTexts}：向量化也要用同一份，
+     * 三处各自手写早晚会漂移（约定 8）。
+     */
     private static String docText(Item item) {
-        return String.join(" ",
-                nvl(item.getTitle()),
-                nvl(item.getCategory()),
-                nvl(item.getLocation()),
-                nvl(item.getDescription()));
-    }
-
-    private static String nvl(String s) {
-        return s == null ? "" : s;
+        return ItemTexts.docText(item);
     }
 }

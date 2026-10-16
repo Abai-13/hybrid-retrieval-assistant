@@ -1,8 +1,8 @@
 # 校园失物招领与 AI 智能匹配平台
 
-校园场景下的失物招领服务平台：注册登录、物品发布/搜索/认领、图片上传，并接入大模型实现 AI 智能问答与**物品自动匹配**。
+校园场景下的失物招领服务平台：注册登录、物品发布与认领、图片上传、站内通知，以及支持多轮对话和混合检索的 **AI 找物助手**。
 
-**技术栈：** Java 17 · Spring Boot 3.3 · MyBatis-Plus 3.5 · MySQL 8 · Redis · JWT · 大模型 API · Vue 3 · Element Plus · Vite
+**技术栈：** Java 17 · Spring Boot 3.3 · MyBatis-Plus 3.5 · MySQL 8 · Redis · Qdrant · JWT · 大模型 / Embedding API · Vue 3 · Element Plus · Vite
 
 > 后端、前端、评测脚本、压测脚本均为独立完成。完整提交记录见本仓库 commit 历史。
 
@@ -16,8 +16,23 @@
   线下核对交接 → 失主确认收到，物品才转为「已认领」。全过程写入 `claim_log`，
   申请详情页可按时间线复盘每一步；归还完成后同一物品上其他申请自动关闭
 - 个人中心：我的发布列表 / 我的认领申请（含「确认收到」入口）/ 我收到的申请（审核台）
-- AI 智能问答：自由提问
-- **AI 物品匹配**：用自然语言描述丢失的东西（如「我的黑色苹果手机不见了」）→ 匹配库里的招领信息，返回结构化结果 + 匹配理由
+- **统一找物助手**：用自然语言描述失物，支持补充条件、纠正地点、撤回条件、排除候选和解释匹配理由；会话与消息存入 MySQL，刷新后可恢复
+- **混合检索**：2-gram 文字召回 + 云端 Embedding / 自托管 Qdrant 向量召回，按物品 ID 去重并用 RRF 融合，交给云端大模型精排，展示物品卡片与理由
+- **发布后自动匹配与通知**：后台异步寻找潜在失主，沿用原 2-gram 召回与独立的分数门槛；不受聊天混合检索开关影响
+
+## 找物助手的处理流程
+
+```text
+用户消息 + 已保存的条件摘要 + 最近几轮对话
+  → 理解意图，合并补充 / 纠正 / 撤回与排除项
+  → 2-gram 召回 + 查询向量化 / Qdrant 检索
+  → 按 ID 去重、RRF 排序，向量候选回 MySQL 复核类型和状态
+  → 云端 LLM 精排 → 匹配卡片与理由 → 保存本轮摘要与消息
+```
+
+发布招领物品后，后台只将标题、类别、地点和描述生成向量；联系方式与认领证明不进入向量文本。
+Qdrant 保存物品 ID、向量及模型 / 文本指纹，MySQL 保存业务数据。索引异步更新，失败后可手动补齐；
+向量路径不可用时回退到文字召回。当前使用云端对话模型与云端 Embedding，未部署本地模型。
 
 ---
 
@@ -100,7 +115,8 @@ EXPLAIN: type=ALL    key=NULL            rows=125571  Extra: Using filesort     
 
 ## AI 物品匹配效果（可复现的评测）
 
-改造前后用**同一套评测集、同一套指标**横向对比，脚本在 [`eval/`](./eval/) 目录，可完整复现。
+以下是历史单轮「2-gram + LLM」链路的评测，改造前后使用同一套评测集和指标，脚本在 [`eval/`](./eval/)。
+这些数字不代表本次多轮聊天或混合向量检索的效果；新链路尚未完成同口径的质量评测。
 
 ### 评测集怎么来的
 
@@ -110,7 +126,7 @@ EXPLAIN: type=ALL    key=NULL            rows=125571  Extra: Using filesort     
 
 ### 结果
 
-| 指标 | 基线 | 现在 |
+| 指标 | 基线 | 2-gram + LLM（历史版本） |
 |---|---:|---:|
 | **Hit@5**（端到端命中率） | 19.2% | **93.2% ~ 94.5%** |
 | 召回率（标准答案进了候选列表） | — | **95.2%** |
@@ -157,23 +173,61 @@ node eval/run-eval.js <标签>      # 例：node eval/run-eval.js after-p2b
 - JDK 17+
 - MySQL 8.x
 - Maven 3.6+
+- Node.js 与 npm（运行 Vue 前端）
 - Redis（**可选**，不装也能跑 —— 连不上时自动降级直查数据库）
+- Docker 与 Qdrant（**可选**，启用向量检索时使用）
 
 ### 2. 配置数据库
 
+本地运行不会自动执行建表脚本。从仓库根目录打开 MySQL 客户端：
+
 ```bash
-# 应用首次启动会自动建库建表，也可以手动执行 sql/schema.sql
-mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS lost_found CHARACTER SET utf8mb4"
+mysql -u root -p
 ```
+
+新建数据库时，在 MySQL 客户端执行：
+
+```sql
+CREATE DATABASE IF NOT EXISTS lost_found CHARACTER SET utf8mb4;
+USE lost_found;
+SOURCE sql/schema.sql;
+```
+
+已有本项目数据库升级时，只需补建会话表，不用重建原表：
+
+```sql
+USE lost_found;
+SOURCE sql/migrations/2026-10-14_ai_conversation.sql;
+```
+
+Docker Compose 的 MySQL 仅在数据卷首次初始化时运行 `sql/schema.sql`；已有数据卷同样需要执行上述增量迁移。
 
 数据库账号密码可通过环境变量 `MYSQL_USERNAME` / `MYSQL_PASSWORD` 注入，或写入本地文件 `application-local.yml`（已 gitignore）。
 
-### 3. 配置 AI（可选）
+### 3. 配置 JWT 与 AI
+
+`JWT_SECRET` 是必填项，使用自行生成的随机密钥，至少 32 字节。AI 凭据按需配置：
 
 ```bash
-# 不配也能启动，AI 接口会返回兜底话术并带上降级原因
-export DEEPSEEK_API_KEY="your-api-key"
+# Bash
+export JWT_SECRET="<替换为你生成的随机密钥，至少32字节>"
+export LLM_API_KEY="<你的对话模型API密钥>"
+export EMBEDDING_API_KEY="<你的向量模型API密钥>"
 ```
+
+```powershell
+# PowerShell
+$env:JWT_SECRET = "<替换为你生成的随机密钥，至少32字节>"
+$env:LLM_API_KEY = "<你的对话模型API密钥>"
+$env:EMBEDDING_API_KEY = "<你的向量模型API密钥>"
+```
+
+对话接口默认使用 DeepSeek，兼容原 `DEEPSEEK_API_KEY` 变量；替换供应商时一起配置 `LLM_API_URL`、`LLM_API_KEY`、`LLM_MODEL`。
+Embedding 独立配置，默认使用硅基流动的 `BAAI/bge-m3`（1024 维），支持 `EMBEDDING_API_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`。
+切换向量维度时还需修改 `embedding.dimension`。服务费用与额度按供应商规则计算。
+
+不配置对话密钥时，应用仍可启动，但助手无法完成模型处理并会提示重试；不配置向量密钥时可设置 `AI_VECTOR_ENABLED=false`，使用原 2-gram 召回。
+也可将上述值写入私有 `src/main/resources/application-local.yml`；不要把真实密钥提交到仓库。
 
 ### 4. 启动后端
 
@@ -188,6 +242,36 @@ cd frontend && npm install && npm run dev    # http://localhost:5173
 ```
 
 前端通过 Vite 代理转发 `/api` 到 8080，无需额外跨域配置。
+
+### 6. 启动向量库 Qdrant（可选 —— 找物助手的语义召回）
+
+```bash
+# 本机 Docker（版本固定 v1.19.2，数据落持久化卷）
+docker compose --profile vector up -d qdrant
+
+# 或不用 compose：
+docker run -d --name lost-found-qdrant -p 6333:6333 -v lost_found_qdrant_data:/qdrant/storage qdrant/qdrant:v1.19.2
+```
+
+- 连接配置在 `application.yml` 的 `qdrant.*` 段（地址 `http://127.0.0.1:6333`，可用环境变量 `QDRANT_URL` 覆盖）。
+- **不起 Qdrant 也完全能跑**：`ai.vector.enabled=true` 时聊天找物走「2-gram + 向量」融合，
+  向量腿连不上就自动回退到原 2-gram，行为与改造前一致；关掉 `AI_VECTOR_ENABLED=false` 则一条向量调用都不会发。
+- 只有**聊天找物入口**用混合召回；发布后的自动匹配仍走原 2-gram 路径，不受影响。
+
+**建索引 / 补齐**（发布成功后会自动异步写入，历史数据靠这条命令补；可重复执行）：
+
+```bash
+# 补齐：模型与文本都没变的点自动跳过，不重复调用 embedding
+mvn spring-boot:run "-Dspring-boot.run.jvmArguments=-Dai.vector.backfill.enabled=true"
+
+# 重建：忽略指纹全量重算（换 embedding 模型后必须执行，并同步换 qdrant.collection 名）
+mvn spring-boot:run "-Dspring-boot.run.jvmArguments=-Dai.vector.backfill.enabled=true -Dai.vector.backfill.force=true"
+```
+
+补齐随这次后端启动执行；若已有后端占用 8080，先停止旧进程，再用上述命令启动。下次正常启动时去掉补齐参数。
+
+> ⚠️ **换 embedding 模型必须换集合名重建**：不同模型的向量不能混在一个集合里比较。
+> 集合里有一个「哨兵点」记录当前模型与维度，模型对不上时补齐会直接报错，不会静默混用。
 
 ---
 
@@ -205,6 +289,10 @@ cd frontend && npm install && npm run dev    # http://localhost:5173
 | PUT | `/api/item/{id}/status` | ✅ | **撤销「已认领」**（仅发布者，只允许 `CLAIMED → UNCLAIMED`） |
 | POST | `/api/ai/chat` | ✅ | AI 问答 |
 | POST | `/api/ai/query` | ✅ | AI 物品匹配 |
+| GET | `/api/ai/session` | ✅ | 读取当前找物会话 |
+| POST | `/api/ai/session` | ✅ | 开始新会话 |
+| GET | `/api/ai/session/{id}` | ✅ | 读取本人会话及消息 |
+| POST | `/api/ai/session/{id}/messages` | ✅ | 发送消息，理解条件并检索 / 解释 |
 | POST | `/api/claim` | ✅ | 提交认领申请（含特征证明） |
 | GET | `/api/claim/my` | ✅ | 我发起的认领申请 |
 | GET | `/api/claim/received` | ✅ | 我收到的认领申请（审核台） |
@@ -221,7 +309,7 @@ cd frontend && npm install && npm run dev    # http://localhost:5173
 **认证方式：** 登录后拿到 token，请求头加 `Authorization: Bearer <token>`。
 
 > ⚠️ **鉴权规则是按 HTTP 方法分的，不是按接口分的**：所有 `GET` 请求允许无 token 访问（公开浏览），
-> 所有 `POST / PUT / DELETE` 必须携带有效 token。所以 AI 的两个接口虽然是「查询语义」，但因为是 POST，**同样需要登录**。
+> 所有 `POST / PUT / DELETE` 必须携带有效 token。AI 查询同样需要登录；私人会话的 GET 接口也在 Service 层校验身份和所有权。
 > 这条规则写在 `JwtInterceptor` 里 —— 之所以不逐个接口配置，是为了避免新增接口时漏配导致越权。
 
 ---
@@ -240,7 +328,7 @@ lost-found/
 │   ├── config/
 │   │   ├── JwtConfig.java / JwtUtil.java      # JWT 配置与工具
 │   │   ├── WebConfig.java                     # CORS + 拦截器 + 静态资源映射
-│   │   ├── AsyncConfig.java                   # 自动匹配用的有界线程池（@EnableAsync）
+│   │   ├── AsyncConfig.java                   # 自动匹配与向量写入各用独立有界线程池
 │   │   ├── LlmConfig.java                     # 大模型配置（供应商可切换）
 │   │   ├── EmbeddingConfig.java               # 向量服务配置
 │   │   ├── RedisConfig.java                   # 缓存序列化（注册 JavaTimeModule）
@@ -254,16 +342,19 @@ lost-found/
 │   │   ├── ClaimService.java            # 认领闭环：状态机 + 流转日志 + 审核/撤回/确认收到
 │   │   ├── AutoMatchService.java        # 发布后自动匹配（开关门面）+ AutoMatchRunner（异步执行体）
 │   │   ├── NotificationService.java     # 站内通知：生成 / 列表 / 已读
-│   │   ├── EmbeddingService.java        # 向量化抽象（当前实现：云端 bge-m3，未接入召回）
+│   │   ├── EmbeddingService.java        # 向量化抽象（当前实现：云端 bge-m3）
+│   │   ├── ConversationService.java     # 找物会话：意图、条件摘要、消息持久化与重试
+│   │   ├── HybridRecallService.java     # 主动聊天的 2-gram + 向量召回 / RRF 融合
+│   │   ├── ItemVectorService.java       # 异步索引、向量检索与幂等补齐
 │   │   └── …                            # Item / User / Ai / File
 │   ├── mapper/  entity/  dto/           # 数据访问 / 表映射 / 请求响应对象
 │   └── interceptor/JwtInterceptor.java  # JWT 鉴权
-├── src/test/                            # 24 个测试（含 MockMvc 接口测试）
-├── frontend/                            # Vue 3 + Element Plus（5 个页面）
+├── src/test/                            # 单元测试与 MockMvc 接口测试
+├── frontend/                            # Vue 3 + Element Plus（含统一找物助手）
 ├── eval/                                # AI 匹配评测：数据集 / 生成器 / 评测脚本 / 各阶段报告
 ├── bench/                               # 压测：JMeter 计划 + REPORT.md
 ├── docs/technical-notes.md              # 36 条项目技术笔记
-└── sql/schema.sql                       # 建表脚本（含索引）
+└── sql/                                # 完整建表脚本及 migrations 增量迁移
 ```
 
 **调用链：** Controller → Service → Mapper → DB，`JwtInterceptor` 在 Controller 之前执行鉴权。
@@ -288,7 +379,7 @@ lost-found/
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | BIGINT PK | 自增主键 |
-| user_id | BIGINT FK | 发布者 ID |
+| user_id | BIGINT | 发布者 ID（逻辑关联） |
 | title | VARCHAR(100) | 物品标题 |
 | type | VARCHAR(10) | LOST（寻物）/ FOUND（招领） |
 | category | VARCHAR(30) | 分类 |
@@ -296,7 +387,7 @@ lost-found/
 | description | TEXT | 详细描述 |
 | image_url | VARCHAR(500) | 图片路径 |
 | contact | VARCHAR(100) | 联系方式 |
-| status | VARCHAR(20) | UNCLAIMED / CLAIMED |
+| status | VARCHAR(20) | UNCLAIMED / CLAIMING / CLAIMED |
 | version | INT | 乐观锁字段 |
 | created_at / updated_at | DATETIME | 自动填充 |
 
@@ -338,6 +429,12 @@ lost-found/
 
 ---
 
+### ai_conversation / ai_message 表（找物会话）
+
+`ai_conversation` 保存用户所有权、条件摘要、当前请求占用、版本和过期时间；
+`ai_message` 保存用户消息、助手结果与卡片 ID，并用 `(conversation_id, request_id, role)` 唯一键处理重复请求。
+历史卡片的标题、地点和状态读取当前 MySQL 数据；会话默认保留 7 天，模型上下文使用条件摘要与最近 4 轮对话。
+
 ## 设计决策
 
 - **为什么不用 Spring Security？** 项目只需 JWT 登录认证，不需要角色权限、OAuth2 等。只引入 `spring-security-crypto` 做 BCrypt + 手写拦截器，代码量少、好理解
@@ -371,19 +468,28 @@ lost-found/
 | 10-08 | **认领闭环**：申请 / 特征证明 / 审核 / 驳回 / 撤回 / 确认收到全链路；状态机 + 流转日志表；生成列唯一键兜底并发；归还后自动关闭其他申请；联系方式按身份收敛；审核台与「我的申请」两个新页面 |
 | 10-08 | **AI 匹配筛选策略拆分**：主动匹配恢复「Top5、不设最低分」；80 分门槛下移到自动匹配（`ai.match.interactive.*` / `ai.match.auto.*` 两套独立配置）；评测环境隔离到 `lost_found_eval` |
 | 10-08 | **发布后自动匹配 + 站内通知**：两个方向（失物→招领、招领→失物）；异步执行不阻塞发布、异常隔离；汇总通知（一条通知带 N 条匹配明细）；总开关 `ai.match.auto.enabled`；类别守卫 |
+| 10-16 | **统一找物助手**：会话持久化、条件补充 / 纠正 / 撤回、候选排除与解释、失败重试与刷新恢复 |
+| 10-16 | **混合检索**：云端 Embedding + 自托管 Qdrant，与原 2-gram 按 ID 去重、RRF 融合；异步索引、幂等补齐与故障回退；自动匹配沿用原路径 |
 
 ---
+
+## 本次验证范围
+
+2026-10-16 对召回融合、去重、候选排除 / 状态过滤、回退、聊天完整条件传递、发布异常隔离和补齐幂等运行了 19 项定向测试，全部通过。
+另用两句短测试文本完成一次真实 Embedding 批量请求（1024 维），在临时 Qdrant 集合写入后检索取回测试点，并删除临时集合。
+
+这次 REST 冒烟证明云端 Embedding 与 Qdrant 基本连通；未验证完整 Spring / 页面业务链路，未进行混合召回质量评测，也未重跑全量、压力或并发测试。
 
 ## 已知问题 / 后续可做
 
 - `COUNT(*)` 平均 41ms，占 SQL 总时间 54% —— 可缓存计数结果，或前端改成「加载更多」不做总数
 - 限流器是内存实现：Map 的 key 从不清理（长时间运行会缓慢泄漏），且多实例部署时各算各的
-- 向量化能力已实现但**尚未接入召回链路**（当前召回用 2-gram 打分，效果已达 95.2% 召回率）
-- Docker 配置已写好（多阶段构建 + compose 三服务），但**尚未在真实环境验证过**
+- 混合检索已接入主动聊天；历史物品需补齐向量，索引与 MySQL 异步同步；新增链路尚无同口径的召回效果数据
+- Docker Compose 的完整应用部署尚未验证；本机 Qdrant REST 冒烟不代表整套 Compose 验收
 - **发布后自动匹配 + 站内通知**：物品发布成功后由后台**异步**跑一遍匹配，够格就给可能的主人发站内通知。
   两个方向都支持 —— 发布失物时匹配已有招领（通知发布者本人），发布招领时**反向**匹配已有失物
   （按失主分组，每位失主对同一次发布最多收到**一条汇总通知**，里面带上匹配到的全部条目：分数 + 理由 + 跳转）。
-  - 与主动匹配**共用召回与精排**，但**筛选策略独立**：自动场景用分数门槛（`ai.match.auto.min-score`）
+  - 与聊天助手共用原 2-gram 召回组件和 LLM 精排能力，自动场景不接向量召回；**筛选策略独立**：自动场景用分数门槛（`ai.match.auto.min-score`）
     压掉无关通知，主动场景不设门槛（用户主动来找，漏报的代价更大）
   - 有总开关 `ai.match.auto.enabled`（默认 true）：关掉后发布照常成功，但**不提交任务、不调模型、不发通知**
   - 类别守卫：失物与招领类别**明确不一致**时默认不通知；任一边是「其他」这类泛分类时交给大模型按文本判断

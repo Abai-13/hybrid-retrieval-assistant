@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick, computed } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import request from '../api/request'
@@ -8,60 +8,306 @@ import { categoryStyle } from '../utils/format'
 const router = useRouter()
 
 /**
- * AI 接口专用超时。默认的 30s 不够 —— 后端一次模型调用正常 20~33s，
- * 叠加读超时重试最坏能到 90s+。给足余量，避免「后端成功、前端报错」。
+ * AI 接口专用超时。后端一轮的预算是 90 秒（可能包含两次模型调用和重试），
+ * 前端必须比它长 —— 反过来会出现「后端还在跑、前端先掐断」：
+ * 用户看到失败，其实后端最后成功了，而这条消息也就白跑了。
  */
 const AI_TIMEOUT_MS = 120000
 
-// chat = 自由问答，query = 按描述匹配招领信息
-const mode = ref('query')
-const question = ref('')
+/** 会话 id：全程由后端校验所有权，这里只是一个"往哪发"的地址 */
+const conversationId = ref(null)
+/** 消息列表。每条：{ role, text, cards?, requestId?, status?, degradeReason?, diagnostics?, retry? } */
+const messages = ref([])
+/** 当前条件 —— 让用户看清系统记住了什么 */
+const conditions = ref([])
+const version = ref(null)
 const loading = ref(false)
+const booting = ref(true)
+const expiredNotice = ref(false)
+const question = ref('')
 const listRef = ref(null)
 
-/**
- * 消息列表。每条：{ role: 'user' | 'ai', text, matches?, meta?, degraded? }
- *
- * 改造前用的是一个 answer 字符串，只能显示最后一次回答 ——
- * 追问一次上一句就没了，而且「我发过什么」也看不到。
- */
-const messages = ref([])
-
-const MODE_META = {
-  chat: {
-    title: 'AI 问答',
-    icon: 'ChatDotRound',
-    tip: '随便问，AI 帮你解答校园失物招领相关的问题。',
-    sub: '试试这样问：',
-    placeholder: '比如：捡到东西应该交到哪里？',
-    samples: ['捡到东西应该交到哪里？', '校园卡丢了怎么补办？', '贵重物品丢了要报警吗？'],
-  },
-  query: {
-    title: 'AI 物品匹配',
-    icon: 'MagicStick',
-    tip: '说得越具体越容易找到 —— 颜色 / 品牌型号 / 在哪丢 / 一眼能认出的特征',
-    sub: '这样说最容易找到：',
-    placeholder: '比如：一把银色的钥匙，圆头的，落在二教阶梯教室',
-    // ⚠️ 例子本身就是提示语，别写成「一个黑色双肩包，昨天在图书馆丢的」这种。
-    //    召回的 2-gram 是靠字面撞的，例子必须示范「库里标题实际会写哪些词」：
-    //    颜色、品牌型号、具体地点，以及最关键的一眼可辨特征（圆头 / 封面卷边 / G502）。
-    //    用户会照着例子写，例子写成什么样，用户就描述成什么样。
-    samples: [
-      '一把银色的车钥匙，圆头的，落在二教阶梯教室',
-      '绿色的罗技 G502 鼠标，昨天下午落在食堂了',
-      '一本汤小丹的操作系统教材，封面有点卷边',
-    ],
-  },
-}
-
-const meta = computed(() => MODE_META[mode.value])
 const isEmpty = computed(() => messages.value.length === 0)
 
-// 切模式要清空对话 —— 两个模式的上下文不通用，
-// 留着上一模式的记录用户会以为 AI「串台」了
-function switchMode() {
-  messages.value = []
+const samples = [
+  '我丢了一部手机',
+  '一把银色的车钥匙，圆头的，落在二教阶梯教室',
+  '绿色的罗技 G502 鼠标，昨天下午落在食堂了',
+]
+
+// ── 会话恢复：刷新后接着聊 ────────────────────────────────
+// 只按「当前登录用户」读，前端存不存会话 id 都不影响结果，
+// 也就不存在"改一下 localStorage 就能看别人对话"这种可能。
+onMounted(restoreSession)
+
+async function restoreSession() {
+  booting.value = true
+  try {
+    const res = await request.get('/ai/session')
+    const data = res.data || {}
+    if (data.conversation) {
+      applyConversation(data.conversation)
+    } else {
+      // 没有可用会话：可能是第一次来，也可能是上一段过期被清理了 —— 后者要说明白。
+      // ⚠️ 这个提示不能被"顺手新建"清掉：先记下来，等用户真的开始聊了再撤
+      expiredNotice.value = !!data.previousExpired
+      await createSession()
+    }
+  } catch (e) {
+    // 拦截器已经提示过；这里只把界面从 loading 里放出来
+  } finally {
+    booting.value = false
+    scrollToBottom()
+  }
+}
+
+function applyConversation(conv) {
+  conversationId.value = conv.id
+  version.value = conv.version
+  conditions.value = conv.conditions || []
+
+  const raw = conv.messages || []
+  // 先按 requestId 建立「用户原话」索引 —— 刷新之后，失败的那一轮仍然要能重试，
+  // 而重试需要原话 + （撤回场景下）结构化指令。这两样都只能从用户消息里取回来
+  const userByRequest = {}
+  raw.forEach((m) => {
+    if (m.role === 'USER') userByRequest[m.requestId] = m
+  })
+
+  // 哪些用户消息已经有助手回复了 —— 没有的那些要在下面补一个可重试的提示。
+  // 这种情况是真实存在的：并发冲突时服务端只落下了用户这一句，助手那行没写成
+  const answered = new Set(
+    raw.filter((m) => m.role === 'ASSISTANT').map((m) => m.requestId),
+  )
+
+  const built = []
+  raw.forEach((m) => {
+    const item = {
+      role: m.role === 'USER' ? 'user' : 'assistant',
+      text: m.text,
+      cards: m.cards || [],
+      requestId: m.requestId,
+      status: m.status,
+      degradeReason: m.degradeReason,
+      diagnostics: m.diagnostics,
+    }
+    if (m.role === 'ASSISTANT' && m.status === 'FAILED') {
+      const user = userByRequest[m.requestId]
+      if (user) {
+        item.retryContent = user.text
+        item.retryRequestId = m.requestId
+        // 撤回指令原样带回来 —— 不能把它当成一句自然语言再让模型猜一次
+        item.retryRetract = user.retract || null
+      }
+    }
+    built.push(item)
+
+    // 孤儿轮：用户说了话，服务端却没留下助手那行（并发冲突时就长这样）。
+    // 刷新之后它必须仍然能重试，否则用户只能说第二遍
+    if (m.role === 'USER' && !answered.has(m.requestId)) {
+      built.push({
+        role: 'assistant',
+        text: '这一轮没有完成（可能是同时发了两条消息）。你的条件都还在，点「重试」我再跑一次。',
+        cards: [],
+        status: 'FAILED',
+        degradeReason: 'INCOMPLETE',
+        requestId: m.requestId,
+        retryContent: m.text,
+        retryRequestId: m.requestId,
+        retryRetract: m.retract || null,
+      })
+    }
+  })
+  messages.value = built
+}
+
+async function createSession() {
+  const res = await request.post('/ai/session')
+  applyConversation(res.data)
+}
+
+async function onNewSession() {
+  if (loading.value) return
+  loading.value = true
+  try {
+    await createSession()
+    expiredNotice.value = false
+    ElMessage.success('已开始新对话，之前的条件不会带过来')
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 服务端状态变了之后，把当前会话重新拉一遍（条件、卡片顺序都要和服务端一致） */
+async function refreshSession() {
+  const res = await request.get('/ai/session')
+  if (res.data?.conversation) {
+    applyConversation(res.data.conversation)
+  }
+}
+
+// ── 发一轮消息 ────────────────────────────────────────────
+function newRequestId() {
+  // 幂等键：重试时必须复用它，否则后端会当成新的一轮，多出一条消息、多花一次模型调用
+  if (crypto?.randomUUID) return crypto.randomUUID()
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+async function ask(text) {
+  const content = (text ?? question.value).trim()
+  if (!content) {
+    ElMessage.warning('请先输入内容')
+    return
+  }
   question.value = ''
+  await runTurn({ content })
+}
+
+/** 撤回某个条件：带结构化指令，后端按字段删，不经过模型理解 */
+async function retractCondition(field) {
+  await runTurn({
+    content: `去掉「${field}」这个条件`,
+    retract: { field },
+  })
+}
+
+/** 重试：复用同一个 requestId —— 后端会重放或重跑，而不是又追加一轮 */
+async function retry(message) {
+  const index = messages.value.indexOf(message)
+  if (index >= 0) messages.value.splice(index, 1)
+  await runTurn({
+    content: message.retryContent,
+    requestId: message.retryRequestId,
+    retract: message.retryRetract || null,
+    pushUser: false,
+  })
+}
+
+async function runTurn({ content, requestId = newRequestId(), retract = null, pushUser = true }) {
+  // ⚠️ 忙碌标记必须在**第一个 await 之前**立起来：放在 await 之后的话，
+  //    连点两次发送 / 回车连按，两个调用会同时通过这道检查，
+  //    结果就是重复提交（对同一段对话发两轮、烧两次模型调用）
+  if (loading.value) return
+  if (!conversationId.value) {
+    ElMessage.warning('会话还没准备好，请稍候')
+    return
+  }
+  loading.value = true
+
+  try {
+    if (pushUser) {
+      messages.value.push({ role: 'user', text: content, requestId })
+    }
+    await scrollToBottom()
+
+    // 带上"我看到的版本"：服务端拿它判断页面上的卡片顺序是不是最新的。
+    // 不带的话，旧标签页里的「第二个」会被按另一批结果解析
+    const body = { requestId, content, conversationVersion: version.value }
+    if (retract) body.retract = retract
+    const res = await request.post(
+      `/ai/session/${conversationId.value}/messages`, body, { timeout: AI_TIMEOUT_MS })
+    await applyTurn(res.data, { content, requestId, retract })
+    expiredNotice.value = false
+  } catch (e) {
+    await onTurnError(e, content, requestId, retract)
+  } finally {
+    loading.value = false
+    await scrollToBottom()
+  }
+}
+
+async function applyTurn(turn, { content, requestId, retract } = {}) {
+  if (!turn) return
+
+  // 幂等重放（后端 replayed=true）：这份响应是那一轮的**历史快照** ——
+  // 旧条件、旧卡片、当时的版本。照常应用会把页面退回旧状态
+  // （黑色那轮的条件 + 白色那轮之后的版本），下一句「第二个」也就数错了。
+  // 正确做法是以服务端会话为准重新同步：不重复追加这条消息，
+  // 条件/版本/卡片顺序全部保留较新的那份，历史回复留在它原来的位置
+  if (turn.replayed) {
+    await refreshSession()
+    return
+  }
+
+  version.value = turn.version
+  conditions.value = turn.conditions || []
+  const failed = turn.status === 'FAILED'
+  messages.value.push({
+    role: 'assistant',
+    text: turn.text || '（没有返回内容）',
+    cards: turn.cards || [],
+    requestId: turn.requestId,
+    status: turn.status,
+    degradeReason: turn.degradeReason,
+    diagnostics: turn.diagnostics,
+    // ★ 失败必须带重试所需的一切：模型超时/坏 JSON 也是失败，
+    //   以前只有"网络异常"那条路有重试入口，模型返回不可用反而没得点
+    ...(failed ? {
+      retryContent: content,
+      retryRequestId: requestId || turn.requestId,
+      retryRetract: retract || null,
+    } : {}),
+  })
+}
+
+async function onTurnError(e, content, requestId, retract) {
+  const code = e?.code ?? e?.response?.data?.code
+  const message = e?.message || e?.response?.data?.message || '请求失败了'
+
+  if (code === 410) {
+    // 会话过期/被清理：重试一百次也一样，只能重新开始
+    messages.value.push({
+      role: 'assistant',
+      text: `${message}\n点下面的「新对话」就能重新开始。`,
+      status: 'FAILED',
+      degradeReason: 'SESSION_EXPIRED',
+      needsNewSession: true,
+    })
+    return
+  }
+  if (code === 409) {
+    // 并发/版本冲突：服务端状态已经变了。**先把最新会话拉回来**，
+    // 让页面上的条件和卡片顺序与服务端对齐，再让用户重试这一轮。
+    //
+    // ⚠️ 这里绝不能一律建议"开新对话" —— 那会把用户辛苦说出来的条件全丢掉，
+    //    而这一轮本来只差一次重试。409 该重试、410 才该重开，这正是两者要分开的原因
+    await refreshSession()
+    if (!messages.value.some((m) => m.role === 'user' && m.requestId === requestId)) {
+      // 服务端没存下这条（冲突发生在写入之前）—— 补回来，否则用户看不到自己说过什么
+      messages.value.push({ role: 'user', text: content, requestId })
+    }
+    messages.value.push({
+      role: 'assistant',
+      text: `${message}\n已经帮你同步到最新状态了，点「重试」会在最新状态上重跑这一轮。`,
+      status: 'FAILED',
+      degradeReason: 'SESSION_CONFLICT',
+      retryContent: content,
+      retryRequestId: requestId,
+      retryRetract: retract,
+    })
+    return
+  }
+  if (code === 429) {
+    messages.value.push({
+      role: 'assistant',
+      text: '问得有点快，稍等一分钟再试。',
+      status: 'FAILED',
+      degradeReason: 'RATE_LIMITED',
+    })
+    return
+  }
+  // 网络/超时：条件都还在服务端，重试一次就好
+  messages.value.push({
+    role: 'assistant',
+    text: '这次没能连上服务。你的条件没有变，可以点「重试」。',
+    status: 'FAILED',
+    degradeReason: 'NETWORK',
+    retryContent: content,
+    retryRequestId: requestId,
+    retryRetract: retract,
+  })
 }
 
 async function scrollToBottom() {
@@ -70,104 +316,90 @@ async function scrollToBottom() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-async function ask(text) {
-  const q = (text ?? question.value).trim()
-  if (!q) {
-    ElMessage.warning('请先输入内容')
-    return
-  }
-
-  messages.value.push({ role: 'user', text: q })
-  question.value = ''
-  loading.value = true
-  await scrollToBottom()
-
-  try {
-    // 两个接口路径不同，但请求体都是 { question }
-    //
-    // ⚠️ 这里必须单独放宽超时：axios 实例默认 30s，但后端一次模型调用
-    //    正常就要 20~33s（免费档模型慢），且 read-timeout 30s × 最多 2 次重试，
-    //    最坏能到 90s+。用默认值会导致「后端还在跑、前端先掐断」，
-    //    用户看到"请求失败"，其实后端最后是成功的。
-    //    其他接口保持 30s 快速失败 —— 这是 AI 接口独有的长耗时特征。
-    const res = await request.post(
-      `/ai/${mode.value}`, { question: q }, { timeout: AI_TIMEOUT_MS })
-    const d = res.data
-
-    messages.value.push({
-      role: 'ai',
-      text: d.answer || '（没有返回内容）',
-      // 匹配模式才有 matches，问答模式是 undefined，模板里用 v-if 挡住
-      matches: mode.value === 'query' ? d.matches || [] : null,
-      // 把后端给的可观测字段带上：出了问题时能一眼看出是"没召回到"
-      // 还是"大模型挂了"，而不是只能看到一句"AI 服务繁忙"
-      meta: {
-        candidates: d.candidateCount,
-        elapsed: d.elapsedMs,
-        degrade: d.degradeReason,
-        // 被"最低匹配分"挡下的条数。它和"模型压根没匹配到"是两回事，
-        // 后端已经把两者的文案分开生成了，这里只是额外标出来方便排查
-        belowThreshold: d.belowThresholdCount || 0,
-        minScore: d.minScore,
-      },
-      degraded: !!d.degradeReason,
-    })
-  } catch (e) {
-    messages.value.push({
-      role: 'ai',
-      text: '请求失败了，稍后再试试。',
-      error: true,
-    })
-  } finally {
-    loading.value = false
-    await scrollToBottom()
-  }
-}
-
 function openItem(id) {
   router.push(`/items/${id}`)
 }
 
-/** 匹配度分档上色：高=绿、中=橙、低=灰 */
+// ── 展示辅助 ──────────────────────────────────────────────
 function scoreColor(score) {
   if (score >= 80) return '#10b981'
   if (score >= 60) return '#f59e0b'
   return '#9ca3af'
+}
+
+/** 物品状态 —— 卡片上的状态是后端读的时候现取的，不是展示当时的快照 */
+function statusMeta(status) {
+  if (status === 'CLAIMED') return { text: '已被认领', cls: 'done' }
+  if (status === 'CLAIMING') return { text: '认领中', cls: 'claiming' }
+  return { text: '待认领', cls: 'open' }
+}
+
+const DEGRADE_TEXT = {
+  UNDERSTAND_FAILED: '这次没能理解你的意思',
+  MATCH_FAILED: '检索没能完成',
+  TURN_TIMEOUT: '等得太久，没查完',
+  SESSION_CONFLICT: '这段对话刚被另一次操作更新过',
+  SESSION_EXPIRED: '这段对话已过期',
+  INCOMPLETE: '这一轮没有完成',
+  RATE_LIMITED: '请求过于频繁',
+  NETWORK: '网络请求失败',
 }
 </script>
 
 <template>
   <div class="lf-page ai-page">
     <div class="lf-page-head">
-      <h1 class="lf-page-title">AI 助手</h1>
-      <p class="lf-page-sub">用大白话描述你丢的东西，AI 帮你从全站招领信息里找</p>
+      <h1 class="lf-page-title">找物助手</h1>
+      <p class="lf-page-sub">直接说丢了什么、长什么样。可以随时补充、纠正，或者告诉我「不是第二个」。</p>
     </div>
 
     <div class="lf-panel shell">
-      <!-- 模式切换 -->
+      <!-- 顶部：当前条件 + 新对话 -->
       <div class="shell-head">
-        <el-radio-group v-model="mode" @change="switchMode">
-          <el-radio-button value="query">
-            <el-icon><MagicStick /></el-icon>AI 物品匹配
-          </el-radio-button>
-          <el-radio-button value="chat">
-            <el-icon><ChatDotRound /></el-icon>AI 问答
-          </el-radio-button>
-        </el-radio-group>
-        <span class="mode-tip">{{ meta.tip }}</span>
+        <div class="cond-block">
+          <span class="cond-label">当前条件</span>
+          <div v-if="conditions.length" class="cond-list">
+            <el-tag
+              v-for="c in conditions"
+              :key="c.field"
+              size="small"
+              :type="c.certainty === 'UNCERTAIN' ? 'warning' : 'primary'"
+              effect="light"
+              :title="c.source ? `来自你说过的话：${c.source}` : ''"
+              closable
+              :disable-transitions="true"
+              @close="retractCondition(c.field)"
+            >
+              {{ c.field }}：{{ c.value }}
+              <em v-if="c.certainty === 'UNCERTAIN'">（不确定）</em>
+            </el-tag>
+          </div>
+          <span v-else class="cond-empty">还没有条件 —— 说说你丢了什么</span>
+        </div>
+
+        <el-button size="small" :disabled="loading" @click="onNewSession">
+          <el-icon><Refresh /></el-icon>新对话
+        </el-button>
       </div>
 
       <!-- 消息区 -->
       <div ref="listRef" class="stream">
-        <!-- 空状态：直接给几个能点的示例，比让用户对着空框发呆强 -->
-        <div v-if="isEmpty" class="welcome">
-          <div class="welcome-icon">
-            <el-icon><component :is="meta.icon" /></el-icon>
-          </div>
-          <div class="welcome-title">{{ meta.title }}</div>
-          <div class="welcome-sub">{{ meta.sub }}</div>
+        <el-alert
+          v-if="expiredNotice"
+          type="info"
+          :closable="false"
+          show-icon
+          title="上一段对话已超过保留期，已经为你开了一段新的"
+          class="notice"
+        />
+
+        <!-- 空状态：给几个能点的示例，比让用户对着空框发呆强 -->
+        <div v-if="isEmpty && !booting" class="welcome">
+          <div class="welcome-icon"><el-icon><MagicStick /></el-icon></div>
+          <div class="welcome-title">找物助手</div>
+          <div class="welcome-sub">说得越具体越容易找到 —— 颜色 / 品牌型号 / 在哪丢 / 一眼能认出的特征</div>
           <div class="samples">
-            <button v-for="s in meta.samples" :key="s" class="sample" @click="ask(s)">
+            <button v-for="s in samples" :key="s" class="sample" :disabled="loading" @click="ask(s)">
               {{ s }}
             </button>
           </div>
@@ -180,18 +412,17 @@ function scoreColor(score) {
             class="row"
             :class="m.role === 'user' ? 'row-user' : 'row-ai'"
           >
-            <div v-if="m.role === 'ai'" class="bot-avatar">
+            <div v-if="m.role === 'assistant'" class="bot-avatar">
               <el-icon><MagicStick /></el-icon>
             </div>
 
-            <div class="bubble" :class="[m.role, { error: m.error }]">
+            <div class="bubble" :class="[m.role, { error: m.status === 'FAILED' }]">
               <div class="bubble-text">{{ m.text }}</div>
 
-              <!-- 匹配结果卡片：后端返回的 matches 结构化数据，
-                   改造前前端只取了 answer 那段文字，这块数据整个是丢掉的 -->
-              <div v-if="m.matches && m.matches.length" class="matches">
+              <!-- 结果卡片：都是真实物品，点得开 -->
+              <div v-if="m.cards && m.cards.length" class="matches">
                 <div
-                  v-for="mt in m.matches"
+                  v-for="(mt, idx) in m.cards"
                   :key="mt.itemId"
                   class="match"
                   @click="openItem(mt.itemId)"
@@ -202,14 +433,17 @@ function scoreColor(score) {
 
                   <div class="match-main">
                     <div class="match-top">
-                      <span class="match-title">{{ mt.title }}</span>
-                      <span class="match-score" :style="{ color: scoreColor(mt.score) }">
+                      <span class="match-title">
+                        <!-- 序号由后端给：解释某一条那一轮只有一张卡，
+                             前端按下标数会把它写成 1，用户下次说「不是第二个」就对不上了 -->
+                        <span class="match-index">{{ mt.index != null ? mt.index : idx + 1 }}</span>{{ mt.title }}
+                      </span>
+                      <span v-if="mt.score != null" class="match-score" :style="{ color: scoreColor(mt.score) }">
                         {{ mt.score }}<i>分</i>
                       </span>
                     </div>
 
-                    <!-- 匹配度进度条 -->
-                    <div class="bar">
+                    <div v-if="mt.score != null" class="bar">
                       <div
                         class="bar-fill"
                         :style="{ width: mt.score + '%', background: scoreColor(mt.score) }"
@@ -219,6 +453,10 @@ function scoreColor(score) {
                     <div class="match-meta">
                       <span v-if="mt.location"><el-icon><LocationInformation /></el-icon>{{ mt.location }}</span>
                       <span v-if="mt.category"><el-icon><Collection /></el-icon>{{ mt.category }}</span>
+                      <!-- 状态是读的时候现取的：上轮还写着「未认领」的东西被认领走之后就改了 -->
+                      <span class="status" :class="statusMeta(mt.status).cls">
+                        <i class="dot" />{{ statusMeta(mt.status).text }}
+                      </span>
                     </div>
 
                     <div v-if="mt.reason" class="match-reason">{{ mt.reason }}</div>
@@ -228,31 +466,32 @@ function scoreColor(score) {
                 </div>
               </div>
 
-              <!-- 匹配模式下一无所获。
-                   ⚠️ 只在「真的没匹配上」时显示：如果是被最低分挡下的，
-                   后端已经在气泡文案里说清「暂未发现高度匹配的物品 + 还有几条相似度低的」，
-                   这里再补一句"没有匹配到"会把话说反，让用户以为平台上一定没有。 -->
-              <div
-                v-else-if="m.matches && m.matches.length === 0 && !m.error && !m.meta.belowThreshold"
-                class="no-match"
-              >
-                没有匹配到招领信息，换个描述再试试
+              <!-- 失败：必须和「没找到」长得不一样，并且给一个重试入口 -->
+              <div v-if="m.status === 'FAILED'" class="fail-line">
+                <el-tag size="small" type="danger" effect="light">
+                  <el-icon><Warning /></el-icon>
+                  {{ DEGRADE_TEXT[m.degradeReason] || '本次未完成' }}
+                </el-tag>
+                <el-button v-if="m.needsNewSession" size="small" type="primary" plain @click="onNewSession">
+                  新对话
+                </el-button>
+                <el-button v-else-if="m.retryRequestId" size="small" type="primary" plain @click="retry(m)">
+                  <el-icon><RefreshRight /></el-icon>重试
+                </el-button>
               </div>
 
-              <!-- 可观测信息：平时不显眼，但排查时能看出问题出在哪一层 -->
-              <div v-if="m.meta && !m.error" class="meta-line">
-                <el-tag v-if="m.meta.degrade === 'LLM_ERROR'" size="small" type="danger" effect="light">
-                  <el-icon><Warning /></el-icon> 大模型调用失败，本次已降级
-                </el-tag>
-                <el-tag v-else-if="m.meta.degrade === 'NO_CANDIDATES'" size="small" type="warning" effect="light">
-                  召回为空，未调用大模型
-                </el-tag>
-                <span v-else>
-                  从 {{ m.meta.candidates }} 条候选中匹配
-                  <template v-if="m.meta.belowThreshold">
-                    · 已按匹配度（≥{{ m.meta.minScore }} 分）筛掉 {{ m.meta.belowThreshold }} 条
+              <!-- 诊断：平时不显眼，排查时能看出问题出在哪一层 -->
+              <div v-else-if="m.diagnostics" class="meta-line">
+                <span>
+                  模型调用 {{ m.diagnostics.modelCalls }} 次
+                  · {{ m.diagnostics.promptTokens + m.diagnostics.completionTokens }} tokens
+                  · 耗时 {{ m.diagnostics.elapsedMs }}ms
+                  <template v-if="m.diagnostics.poolSize">
+                    · 候选池 {{ m.diagnostics.poolSize }} 条取 {{ m.diagnostics.candidateCount }} 条
                   </template>
-                  · 耗时 {{ m.meta.elapsed }}ms
+                  <template v-if="m.diagnostics.excludedCount">
+                    · 已避开你否掉的 {{ m.diagnostics.excludedCount }} 条
+                  </template>
                 </span>
               </div>
             </div>
@@ -261,9 +500,7 @@ function scoreColor(score) {
           <!-- 「正在思考」占位 -->
           <div v-if="loading" class="row row-ai">
             <div class="bot-avatar"><el-icon><MagicStick /></el-icon></div>
-            <div class="bubble ai typing">
-              <span /><span /><span />
-            </div>
+            <div class="bubble ai typing"><span /><span /><span /></div>
           </div>
         </template>
       </div>
@@ -275,14 +512,23 @@ function scoreColor(score) {
           type="textarea"
           :rows="2"
           resize="none"
-          :placeholder="meta.placeholder"
+          :disabled="booting"
+          placeholder="比如：一把银色的钥匙，圆头的，落在二教阶梯教室"
           @keydown.enter.exact.prevent="ask()"
         />
-        <el-button type="primary" :loading="loading" class="send" @click="ask()">
+        <el-button
+          type="primary"
+          class="send"
+          :loading="loading"
+          :disabled="loading || booting"
+          @click="ask()"
+        >
           <el-icon><Promotion /></el-icon>发送
         </el-button>
       </div>
-      <div class="hint">按 Enter 发送 · Shift + Enter 换行</div>
+      <div class="hint">
+        按 Enter 发送 · Shift + Enter 换行 · 回答生成中无法再次发送
+      </div>
     </div>
   </div>
 </template>
@@ -296,19 +542,54 @@ function scoreColor(score) {
   overflow: hidden;
 }
 
-/* ── 顶部模式栏 ───────────────────────────────────────────── */
+/* ── 顶部：当前条件 ───────────────────────────────────────── */
 .shell-head {
-  padding: 14px 18px;
+  padding: 12px 18px;
   border-bottom: 1px solid var(--lf-border);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  justify-content: space-between;
   gap: 14px;
+}
+
+.cond-block {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
-.mode-tip {
+.cond-label {
   font-size: 12.5px;
   color: var(--lf-text-sub);
+  line-height: 24px;
+  flex-shrink: 0;
+}
+
+.cond-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.cond-list em {
+  font-style: normal;
+  opacity: 0.75;
+  font-size: 11px;
+}
+
+.cond-empty {
+  font-size: 12.5px;
+  color: var(--lf-text-muted);
+  line-height: 24px;
+}
+
+.notice {
+  margin-bottom: 14px;
 }
 
 /* ── 消息流 ───────────────────────────────────────────────── */
@@ -374,10 +655,15 @@ function scoreColor(score) {
   transition: all 0.15s;
 }
 
-.sample:hover {
+.sample:hover:not(:disabled) {
   border-color: var(--el-color-primary-light-5);
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
+}
+
+.sample:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* ── 单条消息 ─────────────────────────────────────────────── */
@@ -418,7 +704,7 @@ function scoreColor(score) {
   border-top-right-radius: 3px;
 }
 
-.bubble.ai {
+.bubble.assistant {
   background: #fff;
   border: 1px solid var(--lf-border);
   border-top-left-radius: 3px;
@@ -435,7 +721,15 @@ function scoreColor(score) {
   word-break: break-word;
 }
 
-/* ── 匹配结果卡片 ─────────────────────────────────────────── */
+.fail-line {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ── 结果卡片 ─────────────────────────────────────────────── */
 .matches {
   margin-top: 12px;
   display: flex;
@@ -492,6 +786,21 @@ function scoreColor(score) {
   white-space: nowrap;
 }
 
+/* 序号：用户说「第二个」时数的就是它 */
+.match-index {
+  display: inline-grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  margin-right: 6px;
+  border-radius: 5px;
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
+  font-size: 11px;
+  font-weight: 700;
+  vertical-align: 1px;
+}
+
 .match-score {
   flex-shrink: 0;
   font-size: 15px;
@@ -524,6 +833,7 @@ function scoreColor(score) {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
+  align-items: center;
   font-size: 12px;
   color: var(--lf-text-sub);
 }
@@ -532,6 +842,25 @@ function scoreColor(score) {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status.open {
+  color: #d97706;
+}
+
+.status.claiming {
+  color: #2563eb;
+}
+
+.status.done {
+  color: var(--lf-text-muted);
 }
 
 .match-reason {
@@ -544,12 +873,6 @@ function scoreColor(score) {
 .match-arrow {
   color: var(--lf-text-muted);
   flex-shrink: 0;
-}
-
-.no-match {
-  margin-top: 10px;
-  font-size: 13px;
-  color: var(--lf-text-muted);
 }
 
 .meta-line {

@@ -216,17 +216,62 @@ class AiServiceImplQueryTest {
     }
 
     @Test
-    @DisplayName("模型返回不是合法 JSON 时仍走原有降级（把原文塞进 answer，不抛异常）")
-    void malformedJson_shouldFallBackToRawText() {
+    @DisplayName("★ 模型返回坏 JSON：原文仍可显示，但必须标成 BAD_RESPONSE（绝不能伪装成「没匹配到」）")
+    void malformedJson_isMarkedAsBadResponse() {
         when(llmConfig.getModel()).thenReturn("test-model");
         when(candidateService.recall(anyString(), anyInt())).thenReturn(candidates(1L));
         givenLlmReturns("```json 我不是 JSON");
 
         AiQueryResponse result = aiService.query("一把银色钥匙");
 
+        // 页面上下文中至少还能显示点东西，所以原文留着
         assertNotNull(result.getAnswer());
         assertTrue(result.getMatches().isEmpty());
-        // 解析失败不属于「大模型调用失败」，不该被标成 LLM_ERROR
+        // ⚠️ 以前这里 degradeReason 是 null，于是这段"坏返回"从外面看和"查了但没有"
+        //    一模一样：用户以为平台上真没有，评测也算成一次未命中（把命中率拉低）
+        assertEquals(AiQueryResponse.DEGRADE_BAD_RESPONSE, result.getDegradeReason());
+    }
+
+    @Test
+    @DisplayName("★ 合法 JSON 但缺必要结构（{} / 缺 matches）也算不可用，不能当「没匹配到」")
+    void structurallyIncompleteJson_isMarkedAsBadResponse() {
+        when(llmConfig.getModel()).thenReturn("test-model");
+        when(candidateService.recall(anyString(), anyInt())).thenReturn(candidates(1L, 2L));
+
+        givenLlmReturns("{}");
+        assertEquals(AiQueryResponse.DEGRADE_BAD_RESPONSE, aiService.query("钥匙").getDegradeReason());
+
+        givenLlmReturns("{\"answer\":\"我找到了几条\"}");
+        assertEquals(AiQueryResponse.DEGRADE_BAD_RESPONSE, aiService.query("钥匙").getDegradeReason());
+    }
+
+    @Test
+    @DisplayName("★ 但 matches 为空数组是【正常结果】：查了，确实没有 —— 不能跟着一起算失败")
+    void emptyMatchesArrayIsAValidResult() {
+        when(llmConfig.getModel()).thenReturn("test-model");
+        when(candidateService.recall(anyString(), anyInt())).thenReturn(candidates(1L));
+        givenLlmReturns("{\"answer\":\"没有找到相近的物品\",\"matches\":[]}");
+
+        AiQueryResponse result = aiService.query("一把银色钥匙");
+
+        assertNull(result.getDegradeReason(), "空数组是业务结果，不是故障");
+        assertTrue(result.getMatches().isEmpty());
+        assertEquals("没有找到相近的物品", result.getAnswer());
+    }
+
+    @Test
+    @DisplayName("多出来的非关键字段不影响判定（只要求「能不能用」，不要求逐字照抄格式）")
+    void extraFieldsDoNotInvalidateResponse() {
+        when(llmConfig.getModel()).thenReturn("test-model");
+        when(candidateService.recall(anyString(), anyInt())).thenReturn(candidates(1L));
+        givenLlmReturns("""
+                {"answer":"找到 1 条","matches":[{"itemId":1,"score":90,"reason":"像"}],
+                 "explanation":"顺手多写的一段","confidence":"high"}
+                """);
+
+        AiQueryResponse result = aiService.query("一把银色钥匙");
+
         assertNull(result.getDegradeReason());
+        assertEquals(1, result.getMatches().size());
     }
 }

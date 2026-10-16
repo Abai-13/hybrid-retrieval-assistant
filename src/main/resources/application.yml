@@ -129,6 +129,30 @@ embedding:
   read-timeout: 10
   max-retries: ${EMBEDDING_MAX_RETRIES:2}
 
+# 向量库配置 —— 自托管 Qdrant（本机 Docker），存 FOUND 物品向量
+#
+# 和 embedding 段分开：向量化（调云端）和向量库（本机服务）是两个独立下游，
+# 一个挂了另一个还能干活 —— Qdrant 不可达时查询侧直接回退 2-gram，
+# 聊天找物照常工作。混成一段会让两边的开关和超时互相牵连。
+qdrant:
+  # 总开关：false = 所有向量读写直接不可用（等价于关掉混合召回的向量腿），
+  # 调用方按"向量不可用"回退，日志里看得见。
+  enabled: ${QDRANT_ENABLED:true}
+
+  # 服务地址（不含路径）。容器内访问用 http://qdrant:6333
+  base-url: ${QDRANT_URL:http://127.0.0.1:6333}
+
+  # ⚠️ 集合名 = 模型的身份。换了 embedding.model 就**必须换集合名重建**
+  #    （向量维度/语义空间不同，混在一起比较没有意义）——
+  #    点里存着 model+dimension 哨兵，模型对不上会在启动补齐时直接报错，不会静默混用。
+  collection: ${QDRANT_COLLECTION:lost_found_items}
+
+  # 超时单位是毫秒，且刻意很短：Qdrant 是本机服务，正常个位数毫秒返回。
+  # 给它 3 秒意味着"Qdrant 卡死"时每次找物对话都要白等 3 秒才回退 ——
+  # 回退必须立刻发生，否则「有向量加速」在故障时反而变成「比纯 2-gram 更慢」。
+  connect-timeout-ms: ${QDRANT_CONNECT_TIMEOUT_MS:500}
+  read-timeout-ms: ${QDRANT_READ_TIMEOUT_MS:2000}
+
 # 限流配置
 rate-limit:
   ai:
@@ -144,6 +168,36 @@ ai:
     # 调小了召回不够（候选池里的物品进不来），调大了 token 上去、干扰项也变多。
     # 改这个值必须重跑评测 —— 它直接决定命中率和成本。
     top-k: ${AI_RECALL_TOP_K:50}
+
+  # 向量检索（混合召回）—— 只作用于**聊天找物入口**。
+  #
+  # 关掉它，找物助手完全回到改造前的 2-gram 行为（一条向量调用都不会发）；
+  # 发布后的自动匹配本来就不用它，不受这个开关影响。
+  vector:
+
+    # 混合召回总开关。
+    #   true  → 会话检索走「2-gram + 向量」两路融合，向量腿故障时自动回退
+    #   false → 完全等同改造前：只用 2-gram，不调 embedding、不连 Qdrant
+    # 留这个开关是为了"成本/故障时一键止血"：查询侧每次检索都要调一次云端 embedding，
+    # 真出问题（额度用尽、Qdrant 挂了）时能关掉，而不是只能改代码重新发版。
+    enabled: ${AI_VECTOR_ENABLED:true}
+
+    # 向量腿多取几倍候选，回 MySQL 过滤后再截断（默认 50×3 = 150 条）。
+    # 为什么必须多取：向量库与 MySQL 异步同步，检出的 id 里会有
+    # "已认领/已删除/被用户排除"的 —— 直接取 topK 再过滤，最后可能连 K 条都不剩。
+    overfetch: ${AI_VECTOR_OVERFETCH:3}
+
+    # 分批补齐 / 重建（启动命令，见 VectorBackfillRunner）。
+    backfill:
+      # 默认关：补齐是按需的一次性动作，不是常驻同步。
+      #   启动执行一次：mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Dai.vector.backfill.enabled=true"
+      enabled: ${AI_VECTOR_BACKFILL_ENABLED:false}
+
+      # 每批多少条（DB 查询 + upsert 粒度；embedding 内部还会按 batch-size 再切）
+      batch-size: ${AI_VECTOR_BACKFILL_BATCH_SIZE:100}
+
+      # true = 忽略"模型+文本指纹"全量重算（换模型重建、或怀疑索引脏了时用）
+      force: ${AI_VECTOR_BACKFILL_FORCE:false}
 
   # 结果筛选策略 —— 两个场景共用同一套召回 + 大模型精排，但**筛选策略必须独立**。
   # 只影响"展示哪些"，不改变召回、不改变模型打分、不改变匹配理由。
@@ -181,3 +235,30 @@ ai:
       min-score: ${AI_MATCH_AUTO_MIN_SCORE:80}
 
       max-results: ${AI_MATCH_AUTO_MAX_RESULTS:5}
+
+  # 找物助手会话 —— 第一阶段新增。
+  #
+  # 和上面的 recall / match 是同一件事的两面：那边管"怎么找"，
+  # 这边管"记得住什么、记多久、一次最多花多久"。
+  conversation:
+
+    # 整轮时间预算（毫秒）。一轮里最多两次模型调用（先理解、再匹配/解释），
+    # 两次各自还有重试 —— 它们**共享**这一份预算，不是各自算各自的。
+    # 前端超时是 120 秒：上游必须大于下游最坏耗时，否则会出现
+    # "后端还在跑、前端先掐断"，用户看到失败而其实后端成功了。
+    turn-budget-ms: ${AI_CONVERSATION_TURN_BUDGET_MS:90000}
+
+    # 会话保留天数。最后一次活动 + 这个天数 = 过期时间，过期即清理。
+    # 到期后前端会明确提示重新开始，而不是把一堆用户自己都不记得的条件留着。
+    retention-days: ${AI_CONVERSATION_RETENTION_DAYS:7}
+
+    # 带进模型上下文的最近几轮对话。
+    # 更早的内容已经沉进摘要了，重复喂进去只是烧 token。
+    history-turns: ${AI_CONVERSATION_HISTORY_TURNS:4}
+
+    # 一次最多读回多少条历史消息（刷新恢复页面 + 模型上下文都受它约束）。
+    # 至少要能装下 history-turns 轮（每轮 2 条），启动时会校验。
+    history-messages: ${AI_CONVERSATION_HISTORY_MESSAGES:50}
+
+    # 过期会话的清理时刻（cron）。默认每天 03:17，刻意避开整点。
+    cleanup-cron: ${AI_CONVERSATION_CLEANUP_CRON:0 17 3 * * *}

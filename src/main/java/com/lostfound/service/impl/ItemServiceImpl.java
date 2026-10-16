@@ -308,6 +308,23 @@ public class ItemServiceImpl implements ItemService {
         return itemMapper.selectList(wrapper);
     }
 
+    /**
+     * keyset 分批取招领物品（向量补齐用）。见接口注释 ——
+     * 不带 status 条件、不走 OFFSET，都是有意为之。
+     */
+    @Override
+    public List<Item> listFoundAfter(Long lastId, int limit) {
+        long from = lastId == null ? 0L : lastId;
+        int size = Math.max(1, Math.min(limit, 1000));
+        LambdaQueryWrapper<Item> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(Item::getType, Item.TYPE_FOUND)
+                .gt(Item::getId, from)
+                .orderByAsc(Item::getId)
+                // limit 是本地夹好的 int，不是外部字符串 —— 拼进 SQL 安全
+                .last("LIMIT " + size);
+        return itemMapper.selectList(wrapper);
+    }
+
     // ===================== 私有方法 =====================
 
     /** 校验物品状态取值合法 */

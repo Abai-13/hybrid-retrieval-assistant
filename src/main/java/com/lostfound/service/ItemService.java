@@ -94,4 +94,21 @@ public interface ItemService {
      * 同样必须在所有会改物品状态的写路径上清掉。
      */
     List<Item> listUnclaimedLost();
+
+    /**
+     * 按 id 升序取「大于 {@code lastId} 的招领物品」，最多 {@code limit} 条 ——
+     * 给向量补齐用的 keyset 分批查询。
+     *
+     * <p><b>为什么是 keyset 而不是 {@code OFFSET}</b>：补齐要从头到尾扫全表好几遍，
+     * OFFSET 每多一页都要先丢掉前面所有行，越到后面越慢（和分页接口那个深分页问题同源）。
+     * 按主键递增往下走，每批都从上一批的位置接着查，代价恒定。
+     *
+     * <p>故意<b>不带 status 条件</b>：已认领的招领物品也照样补向量 ——
+     * 「还在不在招领池」是检索那一刻的实时判断，由查询侧回 MySQL 复核，
+     * 索引侧不该复制一份状态快照（复制了就一定会过期）。
+     *
+     * @param lastId 上一批最后一条的 id；第一次调用传 0（自增主键从 1 起）
+     * @param limit  单批上限，实现内部会夹到 1~1000
+     */
+    List<Item> listFoundAfter(Long lastId, int limit);
 }

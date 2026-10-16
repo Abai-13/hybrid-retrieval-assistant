@@ -38,4 +38,18 @@ public interface AiService {
      * @param candidates 已经召回的候选；空列表会直接短路成"没找到"，不浪费一次模型调用
      */
     AiQueryResponse matchAgainst(String question, List<Item> candidates);
+
+    /**
+     * 带整轮时间预算的精排 —— 多轮会话用这一版。
+     *
+     * <p>为什么需要预算：多轮找物助手一轮里可能发两次模型调用（先理解、再匹配），
+     * 每次调用自己还有重试。各自独立地"最多重试到 30 秒超时"，
+     * 一轮就能跑到三分钟，用户早就走了。所以两次调用必须共享同一个截止时刻。
+     *
+     * <p><b>预算只影响"发不发、等多久"，不影响结果怎么算</b> ——
+     * 筛选规则、幻觉防护、字段回填与无预算版本完全一致。
+     *
+     * @param deadlineEpochMs 截止时刻（毫秒时间戳）；{@code LlmTransport.NO_DEADLINE} 表示不限
+     */
+    AiQueryResponse matchAgainst(String question, List<Item> candidates, long deadlineEpochMs);
 }

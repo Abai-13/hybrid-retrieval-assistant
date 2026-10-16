@@ -7,6 +7,7 @@ import com.lostfound.service.AutoMatchService;
 import com.lostfound.service.ClaimService;
 import com.lostfound.service.FileService;
 import com.lostfound.service.ItemService;
+import com.lostfound.service.ItemVectorService;
 import com.lostfound.service.UserService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,6 +22,8 @@ import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
@@ -57,6 +60,10 @@ class ItemControllerTest {
     /** 发布成功后 Controller 会触发它做后台自动匹配（异步，mock 掉不产生副作用） */
     @MockBean
     private AutoMatchService autoMatchService;
+
+    /** 发布成功后 Controller 会触发它写入向量（异步，mock 掉不产生副作用） */
+    @MockBean
+    private ItemVectorService itemVectorService;
 
     /** JwtInterceptor 依赖 JwtUtil，@WebMvcTest 不会加载它，必须 @MockBean 补上 */
     @MockBean
@@ -117,6 +124,28 @@ class ItemControllerTest {
                 .andExpect(jsonPath("$.code").value(200))
                 .andExpect(jsonPath("$.message").value("发布成功"))
                 .andExpect(jsonPath("$.data.title").value("校园卡"));
+    }
+
+    @Test
+    @DisplayName("★ 发布成功 → 触发向量写入；触发本身抛异常也不能让发布失败")
+    void publish_triggersVectorIndex_evenWhenTriggerThrows() throws Exception {
+        when(jwtUtil.validate(TOKEN)).thenReturn(true);
+        when(jwtUtil.getUserId(TOKEN)).thenReturn(1L);
+        when(fileService.upload(any())).thenReturn("/uploads/card.jpg");
+        Item published = buildFoundItemWithContact(10L, 1L);
+        when(itemService.publish(any(), any(), any())).thenReturn(published);
+        // 向量服务整个炸掉 —— 发布是已经成功的业务事实，不能被后台任务撤销
+        doThrow(new RuntimeException("qdrant 挂了")).when(itemVectorService).triggerAfterPublish(any());
+
+        MockMultipartFile dataPart = new MockMultipartFile("data", "", "application/json",
+                "{\"title\":\"校园卡\",\"type\":\"FOUND\",\"category\":\"证件\"}".getBytes(StandardCharsets.UTF_8));
+
+        mockMvc.perform(multipart("/api/item")
+                        .file(dataPart)
+                        .header("Authorization", "Bearer " + TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200));
+        verify(itemVectorService).triggerAfterPublish(published);
     }
 
     @Test

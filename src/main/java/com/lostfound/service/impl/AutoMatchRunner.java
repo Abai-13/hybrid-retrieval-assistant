@@ -1,5 +1,6 @@
 package com.lostfound.service.impl;
 
+import com.lostfound.common.ItemTexts;
 import com.lostfound.dto.AiQueryResponse;
 import com.lostfound.dto.MatchResult;
 import com.lostfound.entity.Item;
@@ -266,13 +267,11 @@ public class AutoMatchRunner {
 
     /**
      * 拼给召回和大模型看的查询文本 —— <b>字段必须和召回的文档侧一致</b>
-     * （title / category / location / description，见 CandidateServiceImpl 的 docText）。
+     * （title / category / location / description，见 {@link com.lostfound.common.ItemTexts}）。
      * 两边字段不一致等于白做。
      */
     private static String buildQueryText(Item item) {
-        return String.join(" ",
-                nvl(item.getTitle()), nvl(item.getCategory()),
-                nvl(item.getLocation()), nvl(item.getDescription()));
+        return ItemTexts.docText(item);
     }
 
     /** 场景B 的文案：收件人是失主，主语是"有人发了招领" */

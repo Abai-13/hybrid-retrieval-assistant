@@ -3,7 +3,7 @@ package com.lostfound.service.impl;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
-import com.lostfound.common.RetrySupport;
+import com.lostfound.common.LlmTransport;
 import com.lostfound.config.LlmConfig;
 import com.lostfound.dto.AiQueryResponse;
 import com.lostfound.dto.MatchResult;
@@ -14,9 +14,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.ArrayList;
@@ -192,7 +190,7 @@ public class AiServiceImpl implements AiService {
     @Override
     public String chat(String question) {
         log.info("AI 问答请求: {}", question);
-        ApiCall call = callLlm(buildChatBody(question));
+        ApiCall call = callLlm(buildChatBody(question), LlmTransport.NO_DEADLINE);
         if (call == null) {
             return "AI 服务繁忙，请稍后重试";
         }
@@ -214,6 +212,19 @@ public class AiServiceImpl implements AiService {
 
     @Override
     public AiQueryResponse matchAgainst(String question, List<Item> candidates) {
+        return matchAgainst(question, candidates, LlmTransport.NO_DEADLINE);
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * 和两参数版本唯一的区别是 {@code deadlineEpochMs}：它被一路传给
+     * {@link LlmTransport}，用来裁短这次调用的读超时、并决定"还值不值得重试"。
+     * <b>所有筛选与解析逻辑一个字都没变</b> —— 预算只影响"发不发、等多久"，
+     * 不影响"结果怎么算"。
+     */
+    @Override
+    public AiQueryResponse matchAgainst(String question, List<Item> candidates, long deadlineEpochMs) {
         long start = System.currentTimeMillis();
 
         AiQueryResponse result = new AiQueryResponse();
@@ -242,7 +253,7 @@ public class AiServiceImpl implements AiService {
 
         // ③ 拼 prompt 并调用大模型
         String prompt = String.format(MATCH_PROMPT_TEMPLATE, question, formatCandidates(candidates));
-        ApiCall call = callLlm(buildMatchBody(prompt));
+        ApiCall call = callLlm(buildMatchBody(prompt), deadlineEpochMs);
 
         if (call == null) {
             result.setAnswer("AI 服务繁忙，请稍后重试");
@@ -261,6 +272,18 @@ public class AiServiceImpl implements AiService {
         // ④ 解析 JSON 并回填本地字段
         try {
             JSONObject json = JSONUtil.parseObj(call.content());
+            // ⚠️ 结构校验必须在取字段之前：`{}` 这种"合法 JSON 但什么也没有"的返回，
+            //    如果不拦住，就会顺理成章地变成"匹配到 0 条 + 一句空话"的**正常结果**。
+            //    那正是最难发现的一类错误 —— 它看起来太像一个业务结果了。
+            if (!isUsableMatchResponse(json)) {
+                log.warn("精排返回缺少必要结构（需要 matches 数组与 answer 字符串）: {}", call.content());
+                // 原文仍然放进 answer：单轮页面上至少还能看到点东西。
+                // 但必须带上 BAD_RESPONSE —— 否则从外面看和"没匹配到"一模一样
+                result.setAnswer(call.content());
+                result.setDegradeReason(AiQueryResponse.DEGRADE_BAD_RESPONSE);
+                result.setElapsedMs(System.currentTimeMillis() - start);
+                return result;
+            }
             List<MatchResult> all = toMatchResults(json.getJSONArray("matches"), candidates);
             // 主动匹配：按分数降序取 Top-N，**不做最低分过滤**（见 NO_SCORE_FILTER 的说明）
             DisplaySelection selection = applyDisplayRules(all, NO_SCORE_FILTER, interactiveMaxResults);
@@ -277,9 +300,11 @@ public class AiServiceImpl implements AiService {
             }
         } catch (Exception e) {
             // 大模型偶尔不按格式返回（最常见的是套一层 ```json 代码块围栏）。
-            // 解析失败不能让整个接口挂掉 —— 把原文塞进 answer，前端至少还能显示。
+            // 解析失败不能让整个接口挂掉 —— 把原文塞进 answer，前端至少还能显示，
+            // 但同样必须标记成 BAD_RESPONSE（见上）
             log.warn("AI 返回内容不是合法 JSON，降级为纯文本展示: {}", call.content());
             result.setAnswer(call.content());
+            result.setDegradeReason(AiQueryResponse.DEGRADE_BAD_RESPONSE);
         }
 
         result.setElapsedMs(System.currentTimeMillis() - start);
@@ -301,66 +326,27 @@ public class AiServiceImpl implements AiService {
     }
 
     /**
-     * 统一调用大模型，集中处理超时、网络异常和重试。
-     * <p>
-     * 具体调哪家由 application.yml 的 llm.* 决定 —— 都是 OpenAI 兼容接口。
+     * 统一调用大模型 —— 具体实现已挪到 {@link LlmTransport}。
      * <p>
      * <b>为什么一定要重试</b>：实测硅基流动免费档存在偶发的长尾延迟 ——
      * 大多数请求 2-3 秒返回，但少数会挂死超过 30 秒的读超时。
      * 评测 146 条时降级率在 1.4% ~ 32.2% 之间剧烈波动，全是这个原因。
      * 而超时重试对免费额度来说是零成本的，收益极大。
+     * <p>
+     * 抽出去的理由：多轮会话一轮可能发两次模型调用，两次必须共享同一份 90 秒预算。
+     * 如果新链路复制一份 HTTP/重试代码，两处会各自演进 —— 这正是
+     * {@code RetrySupport} 当初被抽出来时踩过的同一个坑。
+     * <p>
+     * 不传预算时（老的单轮链路）行为与改造前<b>逐字一致</b>：用同一个 RestTemplate、
+     * 同一套重试规则，所以原有测试不需要改。
      *
      * @return 调用结果；重试后仍失败返回 {@code null}，由调用方决定怎么降级
      */
-    private ApiCall callLlm(JSONObject body) {
-        return callLlm(body, 0);
-    }
-
-    private ApiCall callLlm(JSONObject body, int attempt) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(llmConfig.getApiKey());
-        HttpEntity<String> entity = new HttpEntity<>(body.toString(), headers);
-
-        try {
-            ResponseEntity<String> response = llmRestTemplate.postForEntity(
-                    llmConfig.getApiUrl(), entity, String.class);
-
-            if (response.getStatusCode() != HttpStatus.OK || response.getBody() == null) {
-                log.error("大模型 API 返回异常状态码: {}", response.getStatusCode());
-                return null;
-            }
-
-            JSONObject json = JSONUtil.parseObj(response.getBody());
-            String content = json.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getStr("content");
-
-            // 把 token 用量带出来 —— 评测要拿它对比优化前后的成本，
-            // 改造前这段数据是被丢掉的，导致「省了多少 token」只能靠估
-            JSONObject usage = json.getJSONObject("usage");
-            int promptTokens = usage == null ? 0 : usage.getInt("prompt_tokens", 0);
-            int completionTokens = usage == null ? 0 : usage.getInt("completion_tokens", 0);
-
-            return new ApiCall(content, promptTokens, completionTokens);
-
-        } catch (RestClientException e) {
-            // 连接超时、读取超时、网络异常统一在这里处理
-            if (attempt < maxRetries && RetrySupport.isRetryable(e)) {
-                long waitMs = RetrySupport.backoffMs(attempt);
-                log.warn("大模型调用失败（第 {} 次尝试），{}ms 后重试: {}",
-                        attempt + 1, waitMs, e.getMessage());
-                RetrySupport.sleepQuietly(waitMs);
-                return callLlm(body, attempt + 1);
-            }
-            log.error("调用大模型 API 失败（共尝试 {} 次）", attempt + 1, e);
-            return null;
-        } catch (Exception e) {
-            // 解析失败属于"调用成功了但返回体不对"，重试大概率还是同样的结果
-            log.error("解析大模型返回内容失败", e);
-            return null;
-        }
+    private ApiCall callLlm(JSONObject body, long deadlineEpochMs) {
+        LlmTransport.Result result = LlmTransport.call(
+                llmRestTemplate, llmConfig, body, maxRetries, deadlineEpochMs);
+        return result == null ? null
+                : new ApiCall(result.content(), result.promptTokens(), result.completionTokens());
     }
 
     /**
@@ -414,6 +400,28 @@ public class AiServiceImpl implements AiService {
 
         list.sort(Comparator.comparingInt(MatchResult::getScore).reversed());
         return list;
+    }
+
+    /**
+     * 精排返回是否**结构上可用**。
+     *
+     * <p>判据刻意写得死板：必须有 {@code matches} <b>数组</b>，且 {@code answer} 是
+     * <b>非空白字符串</b>。<b>空数组是合法的</b>（确实一条都不像），
+     * 但"缺字段"和"空结果"是两件事：
+     * <ul>
+     *   <li>{@code {"matches":[]}} → 查了，没有。正常结果，照常返回；</li>
+     *   <li>{@code {}} / {@code {"answer":"找到了"}} → 这段输出<b>用不了</b>，
+     *       既不能当"没匹配到"，也不能拿半截数据糊弄过去。</li>
+     * </ul>
+     * 非关键字段（比如多一个 explanation）一律不管 —— 只要求"能不能用"，
+     * 不要求模型逐字照抄格式，否则一有风吹草动就整轮失败。
+     */
+    static boolean isUsableMatchResponse(JSONObject json) {
+        if (json == null || json.getJSONArray("matches") == null) {
+            return false;
+        }
+        String answer = json.getStr("answer");
+        return answer != null && !answer.isBlank();
     }
 
     /**

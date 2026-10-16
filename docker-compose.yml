@@ -63,10 +63,32 @@ services:
     networks:
       - lost-found-net
 
+  # ---- Qdrant 向量库（可选，默认 profile 不启动）----
+  # 用法：docker compose --profile vector up -d qdrant
+  # 没有它也完全能跑 —— 找物助手的混合召回会自动回退到 2-gram。
+  qdrant:
+    image: qdrant/qdrant:v1.19.2                   # ⚠️ 固定版本，不用 latest（浮动版本 = 交付不可复现）
+    container_name: lost-found-qdrant
+    restart: always
+    profiles: ["vector"]                            # 不加 --profile 时不会被拉起，三服务行为与原来一致
+    ports:
+      - "6333:6333"                                 # REST
+      - "6334:6334"                                 # gRPC（本项目只用 REST）
+    volumes:
+      - qdrant-data:/qdrant/storage                 # 向量持久化（重启不丢）
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lost-found-net
+
 # ---- 数据卷（MySQL 数据持久化）----
 volumes:
   mysql-data:
   redis-data:                                 # Redis 数据持久化（AOF/RDB 文件）
+  qdrant-data:                                # 向量数据持久化
 
 # ---- 内部网络 ----
 networks:

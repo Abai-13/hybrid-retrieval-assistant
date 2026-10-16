@@ -84,8 +84,21 @@ public class AiQueryResponse {
     /** 本次调用使用的大模型名，供评测记录（历史报告缺失模型信息，导致事后无法区分对照组） */
     private String model;
 
-    /** 大模型调用失败 */
+    /** 大模型调用失败（超时、网络、5xx） */
     public static final String DEGRADE_LLM_ERROR = "LLM_ERROR";
     /** 召回为空，压根没调大模型（这是正常路径，不是故障） */
     public static final String DEGRADE_NO_CANDIDATES = "NO_CANDIDATES";
+    /**
+     * 大模型**调通了**，但返回的内容结构上不可用（不是 JSON，或缺 matches / answer）。
+     *
+     * <p><b>为什么必须和"没匹配到"分开</b>：以前这段内容会被原样塞进 answer、
+     * matches 留空、degradeReason 留 null —— 从外面看，它和"查了，但没有"长得一模一样。
+     * 后果是双重的：用户以为平台上真没有自己的东西而放弃；
+     * 基于这些记录算出来的命中率也会被这批"其实是坏的"样本拉低，
+     * 得出"优化之后反而更差"这种颠倒的结论。
+     *
+     * <p>注：单轮接口仍会把原文放进 answer（页面上至少还能看到点东西），
+     * 但**必须带上这个标记**；多轮会话则直接判为可重试的失败。
+     */
+    public static final String DEGRADE_BAD_RESPONSE = "BAD_RESPONSE";
 }

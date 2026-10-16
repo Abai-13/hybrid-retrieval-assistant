@@ -51,7 +51,26 @@ public class WebConfig implements WebMvcConfigurer {
                 );
 
         // 限流拦截器 — 仅拦截 AI 接口（在 JWT 之后执行）
+        //
+        // 为什么把会话的读/建排除掉：限流保护的是**花模型额度**的调用。
+        // 多轮找物助手每轮至少一次请求，页面加载还各有一次读会话，
+        // 全都计入的话，默认 5 次/分钟的额度十几秒就用完了 ——
+        // 用户会在一段正常的对话里突然被 429 挡住。
+        //
+        // ⚠️ 只排除**不调模型**的路径：
+        //    /api/ai/session            GET 读当前会话 / POST 新建会话
+        //    /api/ai/session/{id}       GET 读指定会话
+        //    「*」只匹配一段，所以 /api/ai/session/{id}/messages 仍然受限 ——
+        //    那才是真正调用大模型的接口，它必须留着。
+        //    同理 /api/ai/chat、/api/ai/query 未做任何改动，仍然受限。
+        //
+        // ⚠️ 放行限流 ≠ 放行鉴权：这些接口仍然要求登录，
+        //    会话所有权仍然逐个在 Service 层校验。
         registry.addInterceptor(rateLimitInterceptor)
-                .addPathPatterns("/api/ai/**");
+                .addPathPatterns("/api/ai/**")
+                .excludePathPatterns(
+                        "/api/ai/session",
+                        "/api/ai/session/*"
+                );
     }
 }

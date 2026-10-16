@@ -20,3 +20,8 @@ spring:
     redis:
       host: redis                # docker-compose 里的服务名
       port: 6379
+
+# Docker 环境 Qdrant 用服务名访问（docker compose --profile vector up -d qdrant）
+# 未启动该服务时连不上 → 混合召回自动回退 2-gram，应用照常工作
+qdrant:
+  base-url: ${QDRANT_URL:http://qdrant:6333}
