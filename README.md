@@ -1,4 +1,4 @@
-# 校园失物招领与 AI 智能匹配平台
+# 基于混合检索的多轮对话寻物系统
 
 校园场景下的失物招领服务平台：注册登录、物品发布与认领、图片上传、站内通知，以及支持多轮对话和混合检索的 **AI 找物助手**。
 
@@ -317,7 +317,7 @@ mvn spring-boot:run "-Dspring-boot.run.jvmArguments=-Dai.vector.backfill.enabled
 ## 项目结构
 
 ```
-lost-found/
+hybrid-retrieval-assistant/
 ├── src/main/java/com/lostfound/
 │   ├── common/                          # 公共组件
 │   │   ├── Result.java                  # 统一返回体 {code, message, data, timestamp}
